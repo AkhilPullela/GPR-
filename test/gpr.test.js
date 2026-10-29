@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { parseChromeTraceFile, parseChromeTraceText, parseMarkerText } from '../gpr/parser.js';
-import { summarizeRun, summarizeRounds, generateFindings, compareBaseline } from '../gpr/analyze.js';
+import { summarizeRun, summarizeRounds, generateFindings, compareBaseline, analyzeRun } from '../gpr/analyze.js';
 import { toCsv, reportHtml, reportCsvFiles, createSnapshot } from '../gpr/reports.js';
 import { createDemoRun } from '../gpr/demo.js';
 import { SOURCE } from '../gpr/model.js';
@@ -257,3 +257,155 @@ test('CSV escaping and all report exports preserve demo labelling and missing me
   assert.equal(Object.keys(files).length, 4);
   assert.match(html, /Not captured/);
 });
+
+// --- Import robustness -------------------------------------------------------
+
+test('a truncated Chrome trace array fails with a truncation-specific message, never a comma/bracket error', async () => {
+  const events = Array.from({ length: 400 }, (_, i) => ({ pid: 1, tid: 1, ts: 1000 + i, ph: 'X', name: 'RunTask', dur: 2 }));
+  const full = `{"traceEvents":${JSON.stringify(events)}}`;
+  const truncated = full.slice(0, Math.floor(full.length * 0.6));
+  await assert.rejects(
+    parseChromeTraceFile(chunkedFile(truncated, 7), 'truncated.json'),
+    error => {
+      assert.match(error.message, /Invalid JSON/i);
+      assert.doesNotMatch(error.message, /Expected a comma or closing bracket/i);
+      assert.match(error.message, /truncat|incomplete/i);
+      return true;
+    }
+  );
+});
+
+test('truncation inside a string is detected even when the cut lands between chunks', async () => {
+  const payload = `{"metadata":{"note":"${'x'.repeat(500)}"},"traceEvents":[{"pid":1,"tid":1,"ts":1,"ph":"X","name":"t","dur":1}]}`;
+  await assert.rejects(parseChromeTraceFile(chunkedFile(payload.slice(0, 300), 13), 'string-cut.json'), /Invalid JSON/);
+});
+
+test('a top-level array truncated mid-export is reported as incomplete, not silently accepted', async () => {
+  const full = JSON.stringify(Array.from({ length: 200 }, (_, i) => ({ pid: 1, tid: 1, ts: i + 1, ph: 'X', name: 'Task', dur: 1 })));
+  await assert.rejects(parseChromeTraceFile(chunkedFile(full.slice(0, full.length - 25), 64), 'array-cut.json'), /Invalid JSON/);
+});
+
+test('unsupported wrapper shapes, empty files, and unsupported values fail with actionable messages', async () => {
+  await assert.rejects(parseChromeTraceFile(new Blob(['{}']), 'empty-object.json'), /Unsupported trace JSON/i);
+  await assert.rejects(parseChromeTraceFile(new Blob(['']), 'empty.json'), /Invalid JSON|no events|empty/i);
+  await assert.rejects(parseChromeTraceFile(new Blob(['[]']), 'empty-array.json'), /no events/i);
+  await assert.rejects(parseChromeTraceFile(new Blob(['{"traceEvents":[{"pid":1,"tid":1,"ts":"x","ph":"X","dur":1}]}']), 'bad-ts.json'), /valid microsecond timestamps/i);
+});
+
+test('the streaming parser reports progress and a completion signal exactly once', async () => {
+  const file = chunkedFile(JSON.stringify({ traceEvents: Array.from({ length: 2000 }, (_, i) => ({ pid: 1, tid: 1, ts: i + 1, ph: 'X', name: 'Task', dur: 1 })) }), 256);
+  const progress = [];
+  await parseChromeTraceFile(file, 'progress.json', update => progress.push(update));
+  assert.equal(progress.filter(p => p.complete).length, 1);
+  assert.ok(progress.length > 1);
+  assert.ok(progress.every(p => p.bytesRead <= p.totalBytes));
+});
+
+test('cancelling an import aborts before any result is produced', async () => {
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(parseChromeTraceFile(new Blob([syntheticTrace]), 'cancel.json', () => {}, { signal: controller.signal }), { name: 'AbortError' });
+});
+
+// --- Large data -------------------------------------------------------------
+
+// The fixture concentrates the 50 MiB in per-event `args` payloads, which is
+// both realistic (traces carry large stacks/args) and cheap enough to build and
+// parse inside a unit test.
+test('a valid trace well above 50 MiB imports, extracts real measurements, and is not size-rejected', async () => {
+  const total = 3000;
+  const padding = 'p'.repeat(18800);
+  const batches = [];
+  let buffer = ['{"pid":1,"tid":1,"ts":1000,"ph":"M","name":"thread_name","args":{"name":"CrRendererMain"}}'];
+  for (let i = 0; i < total; i++) {
+    const long = i % 20 === 0;
+    buffer.push(',');
+    buffer.push(`{"pid":1,"tid":1,"ts":${1000 + i * 3},"ph":"X","name":"${long ? 'RunTask' : 'Paint'}","cat":"toplevel","dur":${long ? 186000 : 1000 + (i % 5) * 1000},"args":{"data":{"url":"${padding}","lineNumber":${i}}}}`);
+    if (buffer.length >= 2000) { batches.push(buffer.join('')); buffer = []; }
+  }
+  if (buffer.length) batches.push(buffer.join(''));
+  const text = `{"traceEvents":[${batches.join('')}]}`;
+  assert.ok(text.length > 50 * 1024 * 1024, `fixture should exceed 50 MiB but was ${(text.length / 1048576).toFixed(1)} MiB`);
+  const run = await parseChromeTraceFile(chunkedFile(text, 1024 * 1024), 'large.json');
+  assert.equal(run.metadata.eventCount, total + 1);
+  assert.equal(run.metadata.normalizedEventCount, total);
+  assert.ok(run.metadata.fileSize > 50 * 1024 * 1024);
+  assert.equal(run.metadata.mainThreadDetected, true);
+  assert.equal(run.tasks.length, total);
+  assert.equal(run.tasks.filter(t => t.durationMs >= 50).length, total / 20);
+});
+
+// --- Analysis correctness ---------------------------------------------------
+
+test('chart series are downsampled for large datasets while preserving the first and last sample', () => {
+  const samples = Array.from({ length: 20000 }, (_, i) => ({ timestampMs: i, cpuPercent: i % 100, source: SOURCE.TRACE }));
+  const analyzed = analyzeRun({ id: 'r', buildId: 'b', environment: 'e', game: 'g', source: SOURCE.TRACE, samples, tasks: [], events: [], findings: [] });
+  const series = analyzed.analysis.chartSamples.cpuPercent;
+  assert.ok(series.length <= 1201, `downsampled series was ${series.length}`);
+  assert.ok(series.length < samples.length);
+  assert.equal(series[0].timestampMs, 0);
+  assert.equal(series[series.length - 1].timestampMs, samples.length - 1);
+});
+
+test('findings are ranked by the documented priority factors and expose their rules', () => {
+  const run = { id: 'r', buildId: 'b', environment: 'e', game: 'g', source: SOURCE.TRACE, samples: [], events: [], findings: [], tasks: [{ timestampMs: 1, durationMs: 60, eventName: 'small', evidence: { threadId: 1 } }, { timestampMs: 2, durationMs: 300, eventName: 'big', evidence: { threadId: 1 } }] };
+  const findings = generateFindings(run);
+  const big = findings.find(f => f.value === 300), small = findings.find(f => f.value === 60);
+  assert.equal(big.severity, 'critical');
+  assert.equal(small.severity, 'warning');
+  assert.ok(big.priority > small.priority);
+  assert.match(big.rule, /durationMs >= 50/);
+  assert.equal(big.evidenceQuality, 'measured');
+  assert.ok(big.investigation.length > 0);
+});
+
+test('findings reference evidence whose timestamps fall inside the trace range', () => {
+  const run = parseChromeTraceText(JSON.stringify([
+    { pid: 1, tid: 1, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 1, ts: 1000000, ph: 'X', name: 'RunTask', cat: 'toplevel', dur: 186000 },
+    { pid: 1, tid: 1, ts: 1200000, ph: 'X', name: 'RunTask', cat: 'toplevel', dur: 1000 }
+  ]), 'evidence.json');
+  const analyzed = analyzeRun(run);
+  const stall = analyzed.analysis.findings.find(f => f.category === 'cpu' && f.value >= 50);
+  assert.ok(stall, 'expected a main-thread stall finding');
+  assert.equal(stall.evidence[0].traceFile, 'evidence.json');
+  assert.ok(stall.evidence[0].startUs >= 1000000 && stall.evidence[0].startUs <= 1200000);
+  assert.equal(stall.evidence[0].durationUs, 186000);
+  assert.equal(stall.roundId, undefined);
+});
+
+test('missing metrics produce informational findings rather than zero values', () => {
+  const run = { id: 'r', buildId: 'b', environment: 'e', game: 'g', source: SOURCE.TRACE, samples: [{ timestampMs: 0, fps: 60, source: SOURCE.TRACE }], tasks: [], events: [], findings: [] };
+  const findings = generateFindings(run);
+  const react = findings.find(f => f.id === 'react-instrumentation-missing');
+  const rounds = findings.find(f => f.id === 'round-markers-missing');
+  assert.equal(react.severity, 'info');
+  assert.equal(react.evidenceQuality, 'unavailable');
+  assert.equal(rounds.severity, 'info');
+  assert.equal(findings.some(f => f.value === 0), false);
+});
+
+test('every exported artifact derives from one snapshot so reports match the analyzed run', () => {
+  const run = analyzeRun(createDemoRun());
+  const snapshot = createSnapshot(run);
+  assert.equal(snapshot.findings.length, run.analysis.findings.length);
+  const html = reportHtml(snapshot), files = reportCsvFiles(snapshot);
+  for (const finding of snapshot.findings) assert.match(html, new RegExp(finding.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  const findingRows = files.findings.split('\r\n').length - 1;
+  assert.equal(findingRows, snapshot.findings.length);
+  assert.equal(files.rounds.split('\r\n').length - 1, snapshot.rounds.length);
+  assert.equal(files.samples.split('\r\n').length - 1, run.samples.length);
+  assert.equal(files.events.split('\r\n').length - 1, run.events.length);
+});
+
+test('the HTML report keeps charts, metric definitions, page numbers, and provenance', () => {
+  const snapshot = createSnapshot(analyzeRun(createDemoRun()));
+  const html = reportHtml(snapshot);
+  assert.match(html, /Executive summary/);
+  assert.match(html, /Metric definitions/);
+  assert.match(html, /Page 1/);
+  assert.match(html, /Page 3/);
+  assert.match(html, /page-break-after/);
+  assert.match(html, /Trace metadata|evidence/i);
+});
+

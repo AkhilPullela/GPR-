@@ -2,6 +2,28 @@
 export const SOURCE = Object.freeze({ TRACE: 'chrome-trace', RUNTIME: 'runtime-instrumentation', DEMO: 'demo-fixture' });
 export const EVENT_TYPES = Object.freeze(['roundStart', 'roundEnd', 'bonusStart', 'bonusEnd', 'winAnimationStart', 'winAnimationEnd']);
 
+export const SEVERITY_RANK = Object.freeze({ critical: 0, warning: 1, info: 2 });
+
+/**
+ * Explicit, overridable thresholds used to classify findings. Every value is a
+ * documented default rather than a hidden magic number, so a team can adjust
+ * the rules for its own frame budget without touching the analysis code.
+ */
+export const THRESHOLDS = Object.freeze({
+  longTaskMs: 50,
+  longTaskCriticalMs: 100,
+  frameBudgetMs: 1000 / 60,
+  frameCriticalMs: 2 * (1000 / 60),
+  cpuSpikePercent: 85,
+  cpuCriticalPercent: 95,
+  reactCommitMs: 1000 / 60,
+  reactCriticalMs: 50,
+  heapGrowthBytes: 32 * 1024 * 1024,
+  targetFps: 60,
+  // Ranking weights: higher means the factor pushes a finding up the list.
+  priority: Object.freeze({ severity: Object.freeze({ critical: 1000, warning: 300, info: 40 }), recurrence: 12, duration: 1.5, evidence: 60 })
+});
+
 export function validateRun(run) {
   if (!run || typeof run !== 'object') throw new Error('Run data must be an object.');
   if (typeof run.id !== 'string' || !Array.isArray(run.samples) || !Array.isArray(run.events) || !Array.isArray(run.findings)) {

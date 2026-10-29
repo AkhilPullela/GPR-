@@ -1,25 +1,11 @@
 import { parseChromeTraceFile, parseMarkerText } from './parser.js';
-import { generateFindings, summarizeRounds, summarizeRun } from './analyze.js';
+import { analyzeRun } from './analyze.js';
+
+const post = (stage, message, extra = {}) => self.postMessage({ type: 'progress', stage, message, ...extra });
 
 function attachAnalysis(run) {
   run.metadata = { ...run.metadata, markedRoundCount: new Set(run.events.map(marker => marker.roundId)).size };
-  const findings = generateFindings(run);
-  const analyzedRun = { ...run, findings };
-  run.analysis = {
-    summary: summarizeRun(analyzedRun),
-    findings,
-    rankedFindings: findings.slice().sort((a, b) => ({ critical: 0, warning: 1, info: 2 }[a.severity] - { critical: 0, warning: 1, info: 2 }[b.severity])).slice(0, 100),
-    rounds: summarizeRounds(analyzedRun)
-  };
-  const chartMetrics = ['cpuPercent', 'fps', 'jsHeapUsedBytes', 'reactCommitMs'];
-  run.longTasks = run.tasks.filter(task => task.durationMs >= 50);
-  run.chartSamples = Object.fromEntries(chartMetrics.map(metric => {
-    const values = run.samples.filter(sample => Number.isFinite(sample[metric]));
-    const stride = Math.max(1, Math.ceil(values.length / 1200));
-    return [metric, stride > 1 ? values.filter((_, index) => index % stride === 0 || index === values.length - 1) : values];
-  }));
-  run.chartTimeRange = run.samples.length ? [run.samples[0].timestampMs, run.samples.at(-1).timestampMs] : [0, 0];
-  return run;
+  return analyzeRun(run);
 }
 
 function correlateMarkers(run, fileName, markers) {
@@ -90,25 +76,25 @@ self.onmessage = async event => {
   const { file, fileName, type = 'parse', run } = event.data || {};
   try {
     if (type === 'markers') {
+      post('parsing', 'Reading game markers…');
       const markers = parseMarkerText(await file.text(), run.metadata?.traceOriginUs || 0);
+      post('analyzing', 'Correlating markers with rounds…');
       self.postMessage({ type: 'result', run: correlateMarkers(run, file.name || fileName, markers) });
       return;
     }
-    self.postMessage({ type: 'progress', message: 'Starting streamed trace import…' });
+    post('reading', 'Reading and validating trace JSON…');
     let lastPercent = -1;
     const parsed = await parseChromeTraceFile(file, fileName, ({ bytesRead, totalBytes, complete }) => {
+      if (complete) { post('parsing', 'Trace read; normalizing events…', { percent: 100 }); return; }
       const percent = totalBytes ? Math.min(100, Math.floor(bytesRead / totalBytes * 100)) : 0;
-      if (complete || percent > lastPercent) {
-        lastPercent = percent;
-        self.postMessage({ type: 'progress', message: complete ? 'Trace read; normalizing events…' : `Reading trace file… ${percent}%` });
-      }
+      if (percent > lastPercent) { lastPercent = percent; post('reading', `Reading trace file… ${percent}%`, { percent, bytesRead, totalBytes }); }
     });
-    self.postMessage({ type: 'progress', message: 'Trace parsed; calculating summaries and findings…' });
+    post('analyzing', 'Calculating summaries, rounds, and findings…');
     const analyzed = attachAnalysis(parsed);
     self.postMessage({ type: 'result', run: analyzed });
   } catch (error) {
     const message = error?.name === 'QuotaExceededError' || error?.name === 'RangeError'
-      ? 'The browser ran out of memory while processing this trace. Reduce the recording time range in DevTools and export again.'
+      ? 'The browser ran out of memory while processing this trace. The original file was not modified. Reduce the recording time range in DevTools and export again.'
       : error?.message || 'Trace parsing failed.';
     self.postMessage({ type: 'error', message });
   }

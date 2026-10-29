@@ -6,16 +6,24 @@ A browser-side engineering dashboard for investigating manually captured Zeus vs
 
 - Overview, Performance Trends, Round Analysis, Bottlenecks, Traces, and Reports routes.
 - An isolated 32-round synthetic fixture, always labelled **DEMO DATA — NOT MEASURED** in the application and its exports.
-- Chrome trace JSON import with actionable format errors, streamed worker-based parsing without a fixed file-size cap, event/thread metadata, normalized relative timestamps, task inspection, supported frame intervals, and recognized heap counters.
+- Chrome trace JSON import with a drag-and-drop area and file browser fallback, a staged status machine (file selected → validating → reading → parsing → analyzing → completed / invalid / truncated / unsupported / cancelled / out of memory), measured byte-level progress only, elapsed time, and cancel/retry actions.
+- A correct incremental JSON reader (`gpr/jsonStream.js`) that preserves parser state across chunk boundaries and rejects truncated traces with a truncation-specific message instead of a misleading comma/bracket error. There is no fixed file-size limit.
 - An optional game-marker sidecar import and explicit round/event correlation.
-- Shared analysis and report snapshot modules, trace evidence references, metric-coverage status, round summaries, and findings.
-- Standalone HTML export with inline SVG charts; print-ready HTML for the browser's **Save as PDF** workflow; four separate CSV exports (rounds, time-series samples, findings, and game events).
+- Shared analysis and report snapshot modules, trace evidence references, metric-coverage status, round summaries, and prioritized findings with explicit, overridable rules.
+- Simple and Technical detail views backed by the same analysis data, plus accessible inline definitions for technical terms (`gpr/glossary.js`).
+- Standalone HTML export with inline SVG charts and page numbers; print-ready HTML for the browser's **Save as PDF** workflow; four separate CSV exports (rounds, time-series samples, findings, and game events).
 - Optional, bounded React Profiler callback and Redux-compatible timing middleware helpers in `gpr/instrumentation.js`. These are not connected to the Zeus vs Hades application.
-- A Node built-in test suite in `test/gpr.test.js`; its trace sample is clearly synthetic, not a real Chrome recording.
+- A Node built-in test suite in `test/gpr.test.js` (34 tests); its trace samples are clearly synthetic, not real Chrome recordings.
 
 ## Workspace usage
 
-The project retains its existing Vite setup and package scripts. Use the editor's Run action to open the application. The package also defines development, production-build, and Node test scripts using the repository's existing tools; no added package installation is required. No test or build result is claimed here because execution was not available during implementation.
+The project retains its existing Vite setup and package scripts. Run `npm run dev` to open the application, `npm test` for the Node test suite, and `npm run build` for the production bundle. No added package installation is required.
+
+## Root causes fixed
+
+1. **`Invalid JSON: Expected a comma or closing bracket.`** The previous parser decoded and split the file and then parsed each element, so a truncated or incomplete Chrome trace export produced a generic structural error. The reader now streams the JSON token by token, tracks string/escape/nesting state across chunk boundaries, and reports truncation explicitly. No chunk is ever parsed as standalone JSON, and no event is silently discarded.
+2. **The 50 MB import limit.** The limit is gone. The file is read once as a stream, parsing runs in a Web Worker, and retained data is bounded per category (frames, heap samples, task candidates) with overflow counted and surfaced as a limitation rather than dropped silently.
+3. **`Preview stopped: a loop ran longer than 400ms`.** The original design decoded the whole file and normalized every event on the UI thread, which starves the render loop. Parsing and analysis now run in a Web Worker, the UI only renders aggregated/downsampled series (≤1200 points per metric), and findings/round tables are capped with an explicit "showing N of M" note. The preview warning was a symptom of main-thread starvation, not a separate application bug.
 
 ## Manual trace workflow
 
@@ -32,6 +40,14 @@ Accepted JSON shapes are a top-level trace event array; `{ "traceEvents": [...] 
 Frame-rate samples are based on intervals between recognized frame marker events, not arbitrary task durations. Supported marker names currently include common names such as `DrawFrame`, `Frame`, `SubmitCompositorFrame`, `BeginFrame`, and `FramePresented`. Exact dropped-frame counts are not inferred. Heap samples are extracted only when recognized event arguments identify a heap byte value. Trace task durations never become a CPU percentage. Browser/process CPU utilization requires an explicit supported collector and is otherwise **Not captured**.
 
 The parser reads JSON incrementally from the selected file in a Web Worker, avoiding a complete decoded-file string and keeping parsing off the dashboard thread. It retains parsed event data and normalized analysis structures in worker memory, so exceptionally large traces can still exceed available browser memory; such failures report a recommendation to reduce the recording window in DevTools. There is no arbitrary fixed file-size limit. No real Chrome trace fixture was present in the repository, so validation against real-world trace variants remains outstanding.
+
+## Findings, views, and metric explanations
+
+- Findings carry a title, severity, what happened, why it matters to gameplay, a timestamp or range, duration/recurrence, supporting evidence, investigation steps, and an evidence-quality statement. Measured facts are separated from interpretation, and the UI states that temporal overlap does not prove causation.
+- Severity uses explicit, overridable rules in `gpr/model.js` (`THRESHOLDS`), including the long-task, frame-budget, CPU, React commit, and heap-growth thresholds. No universal performance score is produced.
+- Findings are ranked by a transparent priority score (severity + duration + recurrence + evidence quality) and the contributing factors are shown on each finding.
+- The **Simple** view presents plain-English findings, user impact, rounds, and next steps. The **Technical** view adds the trace timeline, distributions, raw event details, and provenance. Both views read the same analysis object.
+- Missing metrics produce informational findings and **Not captured** placeholders; they are never shown as zero.
 
 ## Game marker contract
 
@@ -53,11 +69,13 @@ Supported types are `roundStart`, `roundEnd`, `bonusStart`, `bonusEnd`, `winAnim
 
 ## Data, provenance, and analysis
 
-- `gpr/model.js` contains shared source constants, basic runtime validation, and coverage functions.
+- `gpr/model.js` contains shared source constants, explicit configurable thresholds, basic runtime validation, and coverage functions.
+- `gpr/jsonStream.js` is the incremental JSON token reader used by the parser.
 - `gpr/parser.js` owns trace and marker parsing; `gpr/trace.worker.js` and `gpr/traceWorkerClient.js` keep normalization, round correlation, summaries, findings, and display-series preparation off the main thread.
-- `gpr/analyze.js` owns pure summary, round, finding, and baseline-compatibility helpers.
+- `gpr/analyze.js` owns pure summary, round, finding, ranking, and baseline-compatibility helpers.
+- `gpr/glossary.js` holds the plain-language definitions used by the in-UI term popovers.
 - `gpr/demo.js` is kept separate from imported trace data.
-- `gpr/reports.js` generates version-1 report snapshots and all export formats.
+- `gpr/reports.js` generates report snapshots and all export formats.
 
 Normalized trace timestamps are milliseconds relative to the first valid trace timestamp; evidence references retain original trace microseconds. Trace charts and round rows show `+N ms` relative timestamps. Chrome trace wall-clock capture time is not assumed: the run reference timestamp is labelled as import time. Demo timestamps are relative to the fixture's `startedAt`. Missing measurements remain absent and are rendered as **Not captured**. Heap growth is only a potential-retention signal; GC timing, sampling interval, and workload variation matter. Correlation is not causation.
 
@@ -65,11 +83,11 @@ Baseline comparison compatibility checks currently exist as a domain helper, but
 
 ## Exports
 
-- **HTML:** portable report with inline SVG trends, metadata, coverage, findings, rounds, and limitations.
-- **PDF:** opens the same print-styled report snapshot in a new browser window and invokes the browser print dialog. Choose **Save as PDF**. This is not a server-side PDF renderer; popup restrictions may require allowing the report window.
-- **CSV:** downloads four separate files from one memoized report snapshot. CSV values are escaped for commas, quotes, and line breaks. Demo exports include the explicit demo label.
+- **HTML:** portable report with an executive summary, prioritized findings, inline SVG trends, metric definitions, trace metadata and measurement coverage, technical evidence, page numbers, and limitations.
+- **PDF:** opens the same print-styled report snapshot in a new browser window and invokes the browser print dialog. Choose **Save as PDF**. The layout uses `@page` sizing, avoids breaking cards and tables across pages, and prints page numbers. This is not a server-side PDF renderer; popup restrictions may require allowing the report window.
+- **CSV:** downloads four separate files (rounds, samples, findings, game events) from one memoized report snapshot. CSV values are escaped for commas, quotes, and line breaks. Demo exports include the explicit demo label.
 
-Browser settings may ask for confirmation when multiple CSV downloads are initiated. Temporary object URLs are revoked after download initiation.
+All exports are produced from a single snapshot of the currently analyzed run, so a report never reflects stale dashboard state. Browser settings may ask for confirmation when multiple CSV downloads are initiated. Temporary object URLs are revoked after download initiation.
 
 ## Optional instrumentation and capture status
 
@@ -79,6 +97,13 @@ Automatic browser capture / CDP runner is **not implemented**. The dashboard doe
 
 ## Testing and remaining work
 
-The test suite exercises streamed trace imports below and above 50 MiB, large event arrays, malformed/truncated/empty inputs, supported trace wrappers, chunk-boundary parsing, cancellation and repeated imports, nested duration pairing, timestamp normalization, frame intervals, markers, round aggregation, missing metrics, finding repeatability, CSV escaping, and demo export labelling. Browser UI end-to-end checks and real-trace validation remain outstanding; tests have not been executed in this environment.
+`npm test` runs 34 Node built-in tests. They cover: successful small trace import; a valid trace above 50 MiB that is not size-rejected and still extracts real measurements; malformed, truncated, and empty inputs; unsupported wrapper shapes; parser chunk boundaries (including 1-byte chunks and escaped strings); repeated imports; cancellation; progress and completion signals; frame intervals and heap counters; missing metrics; round aggregation and incomplete boundaries; finding repeatability, ranking, rules, and evidence links; chart downsampling; and report/CSV consistency.
+
+Verified in this environment (Node v24, vite 5.4.21, React 19.2.7):
+
+- `npm test` — 34/34 passing.
+- `npm run build` — production bundle built successfully (35 modules).
+- The application was rendered in a browser with the synthetic fixture loaded; the Overview, Traces, and Round pages and the term popovers displayed without runtime errors.
+- Large-file handling was verified with synthetic fixtures generated in-process (over 50 MiB, streamed in 1 MiB chunks). A real Chrome DevTools recording was not available in this repository, so validation against real-world trace variants remains outstanding.
 
 Remaining integration work requires access to a real Zeus vs Hades build and recordings: validate actual trace event naming, provide trustworthy CPU/heap/frame sources where absent, instrument explicit game markers, connect and overhead-test the optional React/Redux helpers, implement multi-run baseline selection, and evaluate automatic CDP capture if the repository later adopts a suitable maintained integration.
