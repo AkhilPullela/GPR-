@@ -31,6 +31,8 @@ react, react-dom, vite, and @vitejs/plugin-react.
 - `gpr/analyze.js` — pure summary, round, finding, ranking, and chart-series helpers.
   `analyzeRun(run, config, hooks)` accepts `onStage` and `shouldAbort` hooks.
 - `gpr/model.js` — `THRESHOLDS`, `SEVERITY_RANK`, `METRIC_STATUS`, `metricAvailability`.
+  `METRIC_STATUS.FAILED` means a metric-shaped event existed but could not be parsed;
+  it must never be collapsed into `NOT_CAPTURED`.
 - `gpr/importSession.js` — UI-independent import state machine (sequencing, throttled
   progress, cancellation, failure-preserves-previous-report).
 - `gpr/trace.worker.js` + `gpr/traceWorkerClient.js` — all parsing and analysis run in a
@@ -48,6 +50,12 @@ react, react-dom, vite, and @vitejs/plugin-react.
 - `thread_name` metadata can appear after tasks, so the main-thread filter runs at the
   end of normalization.
 - Chrome heap counters arrive as `ph: "C"` `UpdateCounters` with `args.data.jsHeapSizeUsed`.
+  Memory-shaped events without a recognized byte field are counted in
+  `diagnostics.unparsableHeapCount` and reported as `processing-failed`.
+- Task duration distributions come from the parser's single-pass histogram
+  (`metadata.taskDistribution`); the dashboard must not re-scan the task list to draw it.
+- Parsing progress reports real parsed event counts on a size-scaled stride
+  (`eventStride`). The final update always carries the true total. Never invent percentages.
 - Round/bonus correlation requires explicit imported markers. Never invent round ids,
   bonus names, or boundaries.
 - Temporal overlap is a lead, not causation. Heap growth is not proof of a leak.

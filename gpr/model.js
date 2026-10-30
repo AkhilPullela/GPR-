@@ -112,9 +112,12 @@ export function metricAvailability(run) {
     ? entry(frameCount >= 2 ? METRIC_STATUS.CAPTURED : METRIC_STATUS.PARTIAL, frameCount >= 2 ? 'Frame timing derived from recognized frame events.' : 'Only one frame sample was found, so no frame interval can be computed.', 'Record with the Performance panel so frame markers (FireAnimationFrame/DrawFrame) are included.', frameCount)
     : entry(METRIC_STATUS.NOT_CAPTURED, 'No recognized frame timing events were found.', 'Record a trace that includes rendering frames, and keep DrawFrame/FireAnimationFrame events in the export.', 0);
 
+  const unparsableHeapCount = diagnostics.unparsableHeapCount || 0;
   const memory = heapCount > 0
     ? entry(heapCount >= 2 ? METRIC_STATUS.CAPTURED : METRIC_STATUS.PARTIAL, heapCount >= 2 ? 'JavaScript heap samples available. Growth alone is not proof of a leak.' : 'A single heap sample was found, so no trend can be computed.', 'Record with the Memory checkbox enabled so UpdateCounters events are captured.', heapCount)
-    : entry(METRIC_STATUS.NOT_CAPTURED, 'No supported JavaScript heap counter samples were found.', 'Enable the Memory checkbox in the Performance panel and re-capture so UpdateCounters (jsHeapSizeUsed) events are recorded.', 0);
+    : unparsableHeapCount > 0
+      ? entry(METRIC_STATUS.FAILED, `Found ${unparsableHeapCount} memory-shaped event(s), but none carried a recognized heap byte field. The trace may use an unsupported counter layout.`, 'Re-capture with the Memory checkbox enabled, or export from a Chrome version that writes jsHeapSizeUsed.', 0)
+      : entry(METRIC_STATUS.NOT_CAPTURED, 'No supported JavaScript heap counter samples were found.', 'Enable the Memory checkbox in the Performance panel and re-capture so UpdateCounters (jsHeapSizeUsed) events are recorded.', 0);
 
   const react = reactCount > 0
     ? entry(METRIC_STATUS.CAPTURED, 'Instrumented React/Redux samples were present.', 'Already captured.', reactCount)

@@ -90,6 +90,10 @@ export function summarizeRun(run, config = {}) {
     longTasks: longTasks.length,
     maxTaskMs: Number.isFinite(taskMax) ? taskMax : undefined,
     taskCount: tasks.length,
+    // Task duration distribution comes from the parser's single-pass histogram
+    // so the dashboard never re-scans the task list during render.
+    taskDistribution: run.metadata?.taskDistribution || [],
+    taskBucketBoundsMs: run.metadata?.taskBucketBoundsMs || [],
     reactCommitP95: percentile(samples.map(s => s.reactCommitMs), .95),
     reactSampleCount: react.count,
     availability,

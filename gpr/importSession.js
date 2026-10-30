@@ -136,12 +136,13 @@ export function createImportManager({ parse, onState = () => {}, onResult = () =
         const stage = progress.stage || 'reading';
         emit({
           ...base,
-          status: 'reading',
+          status: stage === 'parsing' ? 'parsing' : 'reading',
           stage,
           message: progress.message || STAGE_LABEL[stage] || 'Processing…',
           detail: STAGE_DETAIL[stage] || '',
           percent: Number.isFinite(progress.percent) ? progress.percent : undefined,
           bytesRead: progress.bytesRead,
+          eventCount: Number.isFinite(progress.eventCount) ? progress.eventCount : state.eventCount,
           elapsedMs: now() - startedAt
         });
       }, local.signal);

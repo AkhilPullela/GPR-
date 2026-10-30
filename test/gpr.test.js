@@ -686,3 +686,104 @@ test('stage hooks fire during analysis and abort cleanly when cancelled', () => 
   assert.deepEqual(stages.map(s => s.stage), ['normalizing', 'analyzing', 'findings', 'preparing']);
   assert.throws(() => analyzeRun(run, {}, { shouldAbort: () => true }), { name: 'AbortError' });
 });
+
+test('streams event-count progress while parsing so the UI can show real progress', async () => {
+  const text = JSON.stringify(realisticTrace({ frames: 600 }));
+  const progress = [];
+  const run = await parseChromeTraceFile(chunkedFile(text, 8192), 'progress.json', update => progress.push(update));
+  const parsing = progress.filter(update => update.stage === 'parsing');
+  assert.ok(parsing.length > 0, 'parsing-stage progress must be reported for a large trace');
+  assert.ok(parsing.every(update => Number.isFinite(update.eventCount) && update.eventCount > 0));
+  // Monotonic so the UI never renders a decreasing event count.
+  for (let i = 1; i < parsing.length; i++) assert.ok(parsing[i].eventCount >= parsing[i - 1].eventCount);
+  // The completion update carries the true total, proving no event was dropped.
+  const final = progress[progress.length - 1];
+  assert.equal(final.complete, true);
+  assert.equal(final.eventCount, run.metadata.eventCount);
+  assert.ok(final.eventCount >= parsing[parsing.length - 1].eventCount);
+});
+
+test('reports the main-thread task duration distribution from a single parser pass', () => {
+  const events = [
+    { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 2, ts: 1001000, ph: 'X', name: 'RunTask', dur: 3000 },
+    { pid: 1, tid: 2, ts: 1010000, ph: 'X', name: 'RunTask', dur: 30000 },
+    { pid: 1, tid: 2, ts: 1020000, ph: 'X', name: 'RunTask', dur: 120000 },
+    { pid: 1, tid: 2, ts: 1030000, ph: 'X', name: 'RunTask', dur: 600000 }
+  ];
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: events }), 'distribution.json');
+  const summary = summarizeRun(run);
+  assert.equal(summary.taskCount, 4);
+  const total = summary.taskDistribution.reduce((sum, bucket) => sum + bucket.count, 0);
+  assert.equal(total, 4, 'every task must land in exactly one bucket');
+  const longBucket = summary.taskDistribution.find(bucket => bucket.fromMs === 100);
+  assert.equal(longBucket.count, 1, 'the 120 ms task belongs in the 100-250 ms bucket');
+  assert.ok(summary.taskDistribution.every(bucket => bucket.count >= 0));
+});
+
+test('a trace with memory-shaped events but no recognized byte field reports processing-failed for heap', () => {
+  const events = [
+    { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 2, ts: 1001000, ph: 'X', name: 'RunTask', dur: 3000 },
+    // Memory-shaped counter with an unrecognized field name.
+    { pid: 1, tid: 2, ts: 1002000, ph: 'C', name: 'MemoryCounter', args: { data: { somethingElse: 123 } } }
+  ];
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: events }), 'memory-shape.json');
+  const availability = metricAvailability(run);
+  assert.equal(availability.memory.status, METRIC_STATUS.FAILED);
+  assert.match(availability.memory.reason, /recognized heap byte field/i);
+  assert.equal(availability.memory.available, false);
+  assert.ok(run.metadata.diagnostics.unparsableHeapCount >= 1);
+});
+
+test('a counter event with no memory meaning is not misreported as a failed heap metric', () => {
+  const events = [
+    { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 2, ts: 1001000, ph: 'X', name: 'RunTask', dur: 3000 },
+    { pid: 1, tid: 2, ts: 1002000, ph: 'C', name: 'CPU.Time', args: { data: { someCounter: 5 } } }
+  ];
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: events }), 'cpu-counter.json');
+  const availability = metricAvailability(run);
+  assert.equal(availability.memory.status, METRIC_STATUS.NOT_CAPTURED);
+  assert.equal(run.metadata.diagnostics.unparsableHeapCount, 0);
+});
+
+test('imports a trace larger than 50 MB with no artificial size limit', async () => {
+  // Streams a synthetic trace past the old 50 MB ceiling in bounded chunks.
+  // Each event carries a padded args payload so the 50 MB boundary is crossed
+  // with a realistic event count rather than millions of tiny objects.
+  const padding = 'x'.repeat(4000);
+  const header = '{"traceEvents":[{"pid":1,"tid":2,"ts":1000000,"ph":"M","name":"thread_name","args":{"name":"CrRendererMain"}}';
+  const encoder = new TextEncoder();
+  const target = 51 * 1024 * 1024;
+  let bytes = encoder.encode(header).byteLength;
+  let ts = 1001000;
+  const file = {
+    size: 0,
+    stream() {
+      return new ReadableStream({
+        start(controller) { controller.enqueue(encoder.encode(header)); },
+        pull(controller) {
+          if (bytes >= target) { controller.enqueue(encoder.encode(']}')); controller.close(); return; }
+          const events = [];
+          for (let i = 0; i < 250; i++) {
+            const duration = ts % 5 === 0 ? 80000 : 4000;
+            events.push(`,{"pid":1,"tid":2,"ts":${ts},"ph":"X","name":"RunTask","cat":"toplevel","dur":${duration},"args":{"data":{"url":"${padding}"}}}`);
+            ts += 16667;
+          }
+          const chunk = events.join('');
+          bytes += encoder.encode(chunk).byteLength;
+          controller.enqueue(encoder.encode(chunk));
+        }
+      });
+    }
+  };
+  const run = await parseChromeTraceFile(file, 'large-51mb.json');
+  file.size = bytes + 2;
+  assert.ok(file.size > 50 * 1024 * 1024, `fixture must exceed 50 MB, was ${file.size}`);
+  assert.ok(run.metadata.eventCount > 10000, `expected a large event count, got ${run.metadata.eventCount}`);
+  assert.ok(run.tasks.length > 0, 'main-thread tasks must be extracted from a large trace');
+  const summary = summarizeRun(run);
+  assert.ok(summary.taskCount > 0);
+  assert.equal(summary.taskDistribution.reduce((sum, bucket) => sum + bucket.count, 0), summary.taskCount);
+});

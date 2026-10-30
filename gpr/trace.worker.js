@@ -87,7 +87,8 @@ self.onmessage = async event => {
     post('validating', 'Validating trace file…');
     post('reading', 'Reading and validating trace JSON…');
     let lastPercent = -1;
-    const parsed = await parseChromeTraceFile(file, fileName, ({ bytesRead, totalBytes, complete }) => {
+    const parsed = await parseChromeTraceFile(file, fileName, ({ bytesRead, totalBytes, complete, eventCount, stage }) => {
+      if (stage === 'parsing') { post('parsing', `${eventCount.toLocaleString()} events parsed…`, { eventCount }); return; }
       if (complete) { post('parsing', 'Trace read; parsing events…', { percent: 100 }); return; }
       const percent = totalBytes ? Math.min(100, Math.floor(bytesRead / totalBytes * 100)) : 0;
       if (percent > lastPercent) { lastPercent = percent; post('reading', `Reading trace file… ${percent}%`, { percent, bytesRead, totalBytes }); }

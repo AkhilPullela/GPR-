@@ -53,6 +53,39 @@ function MetricChart({ title, samples, metric, color, unit, selected, onSelect, 
   </section>;
 }
 
+/**
+ * Main-thread task duration distribution.
+ *
+ * Bars come from the parser's single-pass histogram, so no task list is scanned
+ * during render. The 50 ms boundary is marked because that is the long-task
+ * threshold, not an arbitrary cut.
+ */
+function TaskDistributionChart({ distribution, bounds, taskCount }) {
+  const bars = (distribution || []).filter(bucket => bucket && bucket.count > 0);
+  if (!bars.length) return <section className="panel chart-panel"><div className="panel-heading"><h3><Term id="longTask">Task duration distribution</Term></h3><span className="unit">tasks</span></div><div className="chart-empty"><span className="empty-icon">∿</span><b>Not captured</b><p>No main-thread task durations were available, so no distribution can be drawn.</p></div></section>;
+  const width = 640, height = 205, pad = { l: 44, r: 12, t: 14, b: 30 };
+  const peak = bars.reduce((value, bucket) => Math.max(value, bucket.count), 0);
+  const slot = (width - pad.l - pad.r) / bars.length;
+  const y = value => height - pad.b - (value / (peak || 1)) * (height - pad.t - pad.b);
+  const label = bucket => `${bucket.fromMs === 0 ? 0 : bucket.fromMs}–${bucket.toMs === undefined ? '∞' : bucket.toMs}`;
+  const longTaskMs = bounds?.find(value => value === 50) ?? 50;
+  return <section className="panel chart-panel">
+    <div className="panel-heading"><h3><Term id="longTask">Task duration distribution</Term></h3><span className="unit">{taskCount?.toLocaleString() ?? 0} tasks · ms</span></div>
+    <svg className="chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Main-thread task duration distribution across ${taskCount ?? 0} tasks. Bars longer than ${longTaskMs} ms are long tasks.`}>
+      {[0, .5, 1].map((tick, i) => <g key={i}><line x1={pad.l} x2={width - pad.r} y1={pad.t + tick * (height - pad.t - pad.b)} y2={pad.t + tick * (height - pad.t - pad.b)} className="gridline"/><text x={pad.l - 7} y={pad.t + tick * (height - pad.t - pad.b) + 4} textAnchor="end" className="axis-label">{Math.round(peak - tick * peak)}</text></g>)}
+      {bars.map((bucket, index) => {
+        const isLong = bucket.fromMs >= longTaskMs;
+        const x = pad.l + index * slot + slot * 0.15;
+        const barWidth = slot * 0.7;
+        const top = y(bucket.count);
+        return <g key={label(bucket)}><rect x={x} y={top} width={barWidth} height={Math.max(1, height - pad.b - top)} fill={isLong ? '#d98a4a' : '#6b8cff'} rx="2"><title>{`${label(bucket)} ms · ${bucket.count.toLocaleString()} task(s)${isLong ? ' · long task' : ''}`}</title></rect><text x={x + barWidth / 2} y={height - pad.b + 14} textAnchor="middle" className="axis-label">{bucket.fromMs === 0 ? 0 : bucket.fromMs}</text></g>;
+      })}
+      <text x={pad.l} y={height - 3} className="axis-label">Duration bucket lower bound (ms) · orange bars are long tasks (≥ {longTaskMs} ms)</text>
+    </svg>
+    <div className="chart-foot"><small className="subtle">Buckets count tasks by duration. Nested work is not counted twice because each task is one interval.</small></div>
+  </section>;
+}
+
 function Kpi({ title, term, value, unit, sub, status = 'neutral', statusKey, availability }) {
   const info = statusKey && availability ? availability[statusKey] : undefined;
   const unavailable = info && !info.available;
@@ -274,6 +307,7 @@ export default function App() {
           </div>
           <section className="panel"><div className="panel-heading"><h3>Metric coverage</h3></div><Coverage run={run}/></section>
           {view === 'technical' && <><section className="panel"><div className="panel-heading"><div><h3>Observed long tasks</h3><p>Task duration is not CPU utilization. Threshold: 50 ms.</p></div><span className="count-chip">{longTasks.length}</span></div><TaskTable tasks={longTasks}/></section>
+          <TaskDistributionChart distribution={summary.taskDistribution} bounds={summary.taskBucketBoundsMs} taskCount={summary.taskCount}/>
           <section className="panel"><div className="panel-heading"><h3>Correlated game markers</h3></div>{run.events.length ? <div className="table-wrap"><table><thead><tr><th>Timestamp (ms)</th><th>Round</th><th>Type</th><th>Name</th></tr></thead><tbody>{run.events.slice(0, 200).map((e, i) => <tr key={`${e.timestampMs}-${i}`}><td>{e.timestampMs.toFixed(2)}</td><td>{e.roundId}</td><td>{e.type}</td><td>{e.name || '—'}</td></tr>)}</tbody></table>{run.events.length > 200 && <small className="subtle">Showing first 200 of {run.events.length} markers.</small>}</div> : <p className="inline-empty">No correlated game markers yet. Trace-only analysis remains available.</p>}</section></>}
         </>}
         {page === 'reports' && <>

@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -76,4 +75,14 @@ test('the worker rejects a non-JSON wrapper with an actionable message', async (
   messages.length = 0;
   await run({ type: 'parse', fileName: 'weird.json', file: fakeFile('"just a string"', 'weird.json') });
   assert.ok(last('error').message.length > 20);
+});
+
+test('the worker forwards parsed event counts so the UI can show real parsing progress', async () => {
+  messages.length = 0;
+  await run({ type: 'parse', fileName: 'big.json', file: fakeFile(makeTrace(600), 'big.json') });
+  const parsing = messages.filter(m => m.type === 'progress' && m.stage === 'parsing' && Number.isFinite(m.eventCount));
+  assert.ok(parsing.length > 0, 'worker must forward parsing event counts');
+  for (let i = 1; i < parsing.length; i++) assert.ok(parsing[i].eventCount >= parsing[i - 1].eventCount);
+  assert.ok(parsing.every(m => /events parsed/.test(m.message)));
+  assert.ok(last('result'), 'a result must still be delivered');
 });

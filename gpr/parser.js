@@ -48,6 +48,11 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
 
   let eventCount = 0, normalizedEventCount = 0, malformedTimestampCount = 0, duplicateEventCount = 0;
   let unmatchedEndCount = 0, incompleteBeginCount = 0, mainThreadDurationCount = 0;
+  let unparsableHeapCount = 0;
+  // Fixed buckets over main-thread task durations, so the dashboard can show a
+  // duration distribution without retaining every task in memory.
+  const TASK_BUCKETS_MS = [0, 5, 16.7, 50, 100, 250, 500, 1000, Infinity];
+  const taskBuckets = new Array(TASK_BUCKETS_MS.length - 1).fill(0);
   let minTs = Infinity, maxTs = -Infinity, hasAnyTimestamp = false;
   let mainThreadKey;
 
@@ -77,6 +82,11 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
       if (heapBytes !== undefined && heapBytes >= 0) {
         if (heap.length < limits.heapSamples) heap.push({ ts: timestampUs, bytes: heapBytes, pid: event.pid, tid: event.tid, name, cat: event.cat, durationUs });
         else dropped.heapSamples++;
+      } else if (HEAP_NAMES.test(name) || Object.keys(args).some(key => HEAP_NAMES.test(key))) {
+        // A memory-shaped event existed but carried no recognized byte field.
+        // Tracked so the metric can report "processing failed" instead of
+        // implying the trace simply had no memory data.
+        unparsableHeapCount++;
       }
     }
     if (durationUs / 1000 >= 50 || TASK_NAMES.test(name)) {
@@ -260,6 +270,21 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     }
     tasks.sort((a, b) => a.timestampMs - b.timestampMs);
 
+    // Single pass over tasks fills the duration histogram used by the dashboard.
+    for (const task of tasks) {
+      const duration = task.durationMs;
+      if (!Number.isFinite(duration)) continue;
+      let bucket = TASK_BUCKETS_MS.findIndex((upper, index) => index > 0 && duration < upper);
+      if (bucket === -1) bucket = taskBuckets.length - 1;
+      else bucket -= 1;
+      if (bucket >= 0 && bucket < taskBuckets.length) taskBuckets[bucket]++;
+    }
+    const taskDistribution = taskBuckets.map((count, index) => ({
+      fromMs: TASK_BUCKETS_MS[index] === 0 ? 0 : TASK_BUCKETS_MS[index],
+      toMs: Number.isFinite(TASK_BUCKETS_MS[index + 1]) ? TASK_BUCKETS_MS[index + 1] : undefined,
+      count
+    }));
+
     // Main-thread busy time is resolved after the main thread is known, so a
     // trailing thread_name metadata event still applies to earlier tasks.
     const mainThreadIntervals = busyIntervals.filter(interval => mainThreadKey !== undefined && interval.threadKey === mainThreadKey);
@@ -308,8 +333,11 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
         traceDurationMs: Number.isFinite(maxTs) && Number.isFinite(minTs) ? (maxTs - minTs) / 1000 : undefined,
         mainThreadBusyMs: mergedIntervals.length ? busyTotalMs : undefined,
         mainThreadBusyWindowCount: busySeries.length,
+        taskDistribution,
+        taskBucketBoundsMs: TASK_BUCKETS_MS.map(value => Number.isFinite(value) ? value : null),
         diagnostics: {
           malformedTimestampCount, duplicateEventCount, unmatchedEndCount, incompleteBeginCount, dropped,
+          unparsableHeapCount,
           categories: [...categories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30).map(([name, count]) => ({ name, count })),
           phases: [...phases.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })),
           mainThreadIntervalCount: mainThreadIntervals.length,
@@ -359,11 +387,20 @@ export async function parseChromeTraceFile(file, fileName = file?.name || 'trace
   const normalizer = createTraceNormalizer(fileName, { ...options, fileSize: file.size });
   let sourceFormat;
   let rootMetadata;
+  // Event counts are reported on a stride so the UI can show real progress
+  // without a message per event. The stride scales with file size so a large
+  // trace does not flood the worker channel.
+  let acceptedEvents = 0;
+  const eventStride = file.size > 32 * 1024 * 1024 ? 25000 : file.size > 4 * 1024 * 1024 ? 5000 : 500;
   try {
     if (signal?.aborted) throw new DOMException('Trace import was cancelled.', 'AbortError');
     const root = await reader.readRoot(event => {
       if (signal?.aborted) throw new DOMException('Trace import was cancelled.', 'AbortError');
       normalizer.accept(event);
+      acceptedEvents++;
+      if (acceptedEvents % eventStride === 0) {
+        onProgress({ bytesRead: reader.bytesRead, totalBytes: file.size, eventCount: acceptedEvents, stage: 'parsing' });
+      }
     });
     sourceFormat = root.kind;
     rootMetadata = root.metadata;
@@ -376,7 +413,7 @@ export async function parseChromeTraceFile(file, fileName = file?.name || 'trace
   if (signal?.aborted) throw new DOMException('Trace import was cancelled.', 'AbortError');
   const run = normalizer.finish({ buildId: rootMetadata?.metadata?.buildId, environment: rootMetadata?.metadata?.environment });
   run.metadata.sourceFormat = sourceFormat;
-  onProgress({ bytesRead: file.size, totalBytes: file.size, complete: true });
+  onProgress({ bytesRead: file.size, totalBytes: file.size, eventCount: acceptedEvents, complete: true });
   return run;
 }
 
