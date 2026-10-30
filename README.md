@@ -1,4 +1,4 @@
-# Zeus vs Hades — Game Performance Reporter (GPR)
+## Game Performance Reporter (GPR)
 
 A browser-side engineering dashboard for investigating manually captured Zeus vs Hades performance runs. The current project extends the existing React/Vite application and uses browser-native SVG, File APIs, Web Workers, and print styles rather than adding UI/chart dependencies.
 
