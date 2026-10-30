@@ -5,7 +5,7 @@ import { importMarkersInWorker, parseChromeTraceInWorker } from './gpr/traceWork
 import { createSnapshot, reportHtml, reportCsvFiles, reportFileBase } from './gpr/reports.js';
 import { SOURCE, displayValue, metricAvailability, METRIC_STATUS_LABEL, SEVERITY_RANK } from './gpr/model.js';
 import { GLOSSARY } from './gpr/glossary.js';
-import { createImportManager, initialImportState, isBusyStage, STAGE_LABEL } from './gpr/importSession.js';
+import { createImportManager, describeImportControl, initialImportState, isBusyStage, STAGE_LABEL } from './gpr/importSession.js';
 import './styles.css';
 
 const nav = [
@@ -139,7 +139,11 @@ export default function App() {
         setEventTypeFilter('all');
         setRunEpoch(epoch => epoch + 1);
         setError('');
-        setNotice(`Imported ${file.name}: ${parsed.metadata.normalizedEventCount.toLocaleString()} recognized events, ${parsed.tasks.length.toLocaleString()} main-thread tasks.`);
+        // Defensive: a malformed metadata field must never turn a successful
+        // import into an error toast after the run has already been applied.
+        const recognized = parsed.metadata?.normalizedEventCount ?? parsed.metadata?.eventCount ?? 0;
+        const taskCount = parsed.tasks?.length ?? 0;
+        setNotice(`Imported ${file.name}: ${recognized.toLocaleString()} recognized events, ${taskCount.toLocaleString()} main-thread tasks.`);
       },
       onError: () => {
         // The previous successful run is intentionally left in place.
@@ -211,7 +215,14 @@ export default function App() {
   }
   function loadDemo() { cancelImport(); setRun(analyzeRun(createDemoRun())); setError(''); setNotice('Synthetic 32-round fixture loaded. It is not measured game data.'); setSelectedRound(null); setRange([0, 100]); setRunEpoch(epoch => epoch + 1); importManager.current?.reset(); }
   function resetImport() { lastFile.current = null; importManager.current?.reset(); }
-  function importTrace(file) { if (!file) return; startTimer(); importManager.current?.start(file).finally(stopTimer); }
+  function importTrace(file) {
+    if (!file) return;
+    // Record the attempt before starting so Retry works even when the very
+    // first import fails; onResult only fires on success.
+    lastFile.current = file;
+    startTimer();
+    importManager.current?.start(file).finally(stopTimer);
+  }
   function retryImport() { if (lastFile.current) importTrace(lastFile.current); }
 
   async function importMarkers(file) {
@@ -261,17 +272,22 @@ export default function App() {
   }), [rounds, sortKey, sortDir, severityFilter, availability, eventTypeFilter, findingsByRound]);
 
   const isBusy = isBusyStage(importState.stage);
+  // Single source of truth for the import control. The control is always
+  // visible and always enabled, so a completed, failed, or cancelled import
+  // can never hide it or leave it permanently disabled.
+  const importControl = describeImportControl(importState);
 
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><div className="brand-icon">G</div><div><b>GPR</b><small>GAME PERFORMANCE</small></div></div><div className="nav-label">WORKSPACE</div><nav aria-label="Main navigation">{nav.map(([key, label, icon]) => <button className={`nav-item ${page === key ? 'active' : ''}`} key={key} onClick={() => go(key)} aria-current={page === key ? 'page' : undefined}><span>{icon}</span>{label}</button>)}</nav><div className="sidebar-bottom"><div className="capture-status"><span className="status-dot"/><div><b>Manual capture</b><small>Trace import available</small></div></div><small className="version">GPR · report schema v2</small></div></aside>
-    <main className="main-area"><header className="topbar"><div><div className="eyebrow">ZEUS VS HADES / PERFORMANCE LAB</div><h1>{nav.find(n => n[0] === page)?.[1]}</h1></div><div className="run-meta"><span className="run-dot"/><div><small>SELECTED RUN</small><strong>{run ? run.id : 'No run selected'}</strong></div><button className="button secondary compact" onClick={loadDemo}>Load demo</button></div></header>
+    <main className="main-area"><header className="topbar"><div><div className="eyebrow">ZEUS VS HADES / PERFORMANCE LAB</div><h1>{nav.find(n => n[0] === page)?.[1]}</h1></div><div className="run-meta"><span className="run-dot"/><div><small>SELECTED RUN</small><strong>{run ? run.id : 'No run selected'}</strong></div><TraceFileInput onFile={importTrace} className="button primary compact" label={importControl.busy ? 'Importing…' : 'Import trace'}/><button className="button secondary compact" onClick={loadDemo}>Load demo</button></div></header>
+      <GlobalImportProgress control={importControl} state={importState} onCancel={cancelImport}/>
       {run && <div className="run-strip"><span className={`source-chip ${run.source === SOURCE.DEMO ? 'demo' : ''}`}>{run.source === SOURCE.DEMO ? 'DEMO DATA — NOT MEASURED' : run.source === SOURCE.TRACE ? 'CHROME TRACE' : 'RUNTIME INSTRUMENTATION'}</span><span>Build <b>{run.buildId}</b></span><span>Environment <b>{run.environment}</b></span><span>{run.source === SOURCE.TRACE ? 'Imported' : 'Started'} <b>{new Date(run.startedAt).toLocaleString()}</b></span>{run.events.length > 0 && <span>{run.metadata?.markedRoundCount ?? new Set(run.events.map(e => e.roundId)).size} marked rounds</span>}</div>}
       {(error || notice) && <div className={`toast ${error ? 'error' : ''}`} role={error ? 'alert' : 'status'}>{error || notice}<button aria-label="Dismiss message" onClick={() => { setError(''); setNotice(''); }}>×</button></div>}
       <div className="toolbar-row">
         <div className="view-switch" role="group" aria-label="Detail level"><span className="view-label">Detail</span><button className={view === 'simple' ? 'active' : ''} onClick={() => setView('simple')} aria-pressed={view === 'simple'}>Simple</button><button className={view === 'technical' ? 'active' : ''} onClick={() => setView('technical')} aria-pressed={view === 'technical'}>Technical</button></div>
         <small className="subtle">{view === 'simple' ? 'Plain-English findings, impact, and next steps.' : 'Timeline, distributions, raw events, and evidence.'}</small>
       </div>
-      {!run ? <div className="content"><Empty title="Start with a performance run">Import a Chrome DevTools trace to analyze observed browser activity, or load the clearly labelled synthetic fixture to explore the dashboard.<div className="empty-actions"><TraceFileInput onFile={importTrace} className="button primary" label="Import Chrome trace"/><button className="button secondary" onClick={loadDemo}>Load demo fixture</button></div><p className="subtle">Main-thread busy time, game rounds, and framework activity only appear when supported measurements or markers are provided. CPU utilization is never invented from task time.</p></Empty></div> : <div className="content">
+      {!run ? <div className="content"><Empty title="Start with a performance run">Import a Chrome DevTools trace to analyze observed browser activity, or load the clearly labelled synthetic fixture to explore the dashboard.<div className="empty-actions"><TraceFileInput onFile={importTrace} className="button primary" label={importControl.busy ? 'Importing…' : 'Import Chrome trace'}/><button className="button secondary" onClick={loadDemo}>Load demo fixture</button></div><p className="subtle">Main-thread busy time, game rounds, and framework activity only appear when supported measurements or markers are provided. CPU utilization is never invented from task time.</p></Empty></div> : <div className="content">
         {page === 'overview' && <>
           <Overview summary={summary} run={run} findings={rankedFindings} rounds={rounds} coverage={summary.coverage} coverageAvailability={run.metadata?.availability || metricAvailability(run)} chartSamples={chartSamples} view={view} selectedPoint={selectedPoint} setSelectedPoint={setSelectedPoint} go={go} openFindings={openFindings} selectedRound={selectedRound} setSelectedRound={setSelectedRound} severityByRound={severityByRound} sortKey={sortKey} sortDir={sortDir} sortRounds={sortRounds} showAll={showAllFindings} setShowAll={setShowAllFindings} exportHtml={exportHtml} exportPdf={exportPdf} exportCsv={exportCsv}/>
         </>}
@@ -299,7 +315,7 @@ export default function App() {
           <div className="trace-grid">
             <section className="panel import-panel">
               <div className="panel-heading"><div><h3>Import Chrome trace</h3><p>Chrome DevTools Performance JSON exports</p></div></div>
-              <ImportPanel key={runEpoch} state={importState} onFile={importTrace} onCancel={cancelImport} onRetry={retryImport} onReset={resetImport} isBusy={isBusy}/>
+              <ImportPanel key={runEpoch} state={importState} control={importControl} onFile={importTrace} onCancel={cancelImport} onRetry={retryImport} onReset={resetImport}/>
               <div className="trace-note"><b>Recognized:</b> traceEvents arrays, {`{traceEvents: [...]}`}, and common wrapper shapes; complete-duration and paired B/E events, thread metadata, recognized frames, heap counters, and main-thread tasks.<br/><b>Not claimed:</b> CPU utilization from task duration or rounds without explicit markers. Parsing runs in a background worker, so the file is read once and never re-read or copied into the UI.</div>
               <hr/><h3>Optional game marker sidecar</h3><p>Import marker JSON aligned to the trace clock. Unsupported or invalid markers are rejected with details.</p><TraceFileInput onFile={importMarkers} className="button secondary" label="Import markers" disabled={run.source === SOURCE.DEMO}/>{run.source === SOURCE.DEMO && <small className="subtle block">Load a real trace before attaching markers. Demo data remains isolated.</small>}
             </section>
@@ -363,9 +379,36 @@ function TraceFileInput({ onFile, className, accept = '.json,application/json', 
   return label ? <label className={className}>{label}{control}</label> : control;
 }
 
-function ImportPanel({ state, onFile, onCancel, onRetry, onReset, isBusy }) {
+/**
+ * Global import progress. Rendered in the shell (not inside a page), so progress
+ * is visible on every route — including the empty state, where the per-page
+ * import panel is not mounted. It renders nothing when idle so it never adds
+ * visual noise between imports.
+ */
+function GlobalImportProgress({ control, state, onCancel }) {
+  if (control.status === 'idle' || !state.fileName) return null;
+  const tone = control.status === 'error' ? 'error' : control.status === 'cancelled' ? 'cancelled' : control.busy ? 'busy' : 'completed';
+  return <div className={`global-progress ${tone}`} role="status" aria-live="polite">
+    <span className={`stage-dot ${control.status}`} aria-hidden="true"/>
+    <b>{control.stageLabel}</b>
+    {control.fileName && <span className="file-chip" title={control.fileName}>{control.fileName}{control.fileSize !== undefined ? ` · ${formatBytes(control.fileSize)}` : ''}</span>}
+    {control.busy && <div className="global-progress-bar" aria-hidden="true">{control.percent !== undefined
+      ? <div className="progress-measured"><span style={{ width: `${control.percent}%` }}/></div>
+      : <div className="progress indeterminate"><span/></div>}</div>}
+    <span className="global-progress-message">{control.error || control.message}</span>
+    {control.busy && <>
+      {control.percent !== undefined && <span className="subtle">{control.percent}%</span>}
+      {control.eventCount !== undefined && <span className="subtle">{control.eventCount.toLocaleString()} events</span>}
+      {control.elapsedMs !== undefined && <span className="subtle">{formatDuration(control.elapsedMs)}</span>}
+      <button className="button secondary compact" onClick={onCancel}>Cancel</button>
+    </>}
+  </div>;
+}
+
+function ImportPanel({ state, control, onFile, onCancel, onRetry, onReset }) {
   const [dragOver, setDragOver] = useState(false);
-  const statusLabel = STAGE_LABEL[state.stage] || STAGE_LABEL[state.status] || 'Idle';
+  const isBusy = control.busy;
+  const statusLabel = control.stageLabel;
   return <div className="import-wrap">
     <label className={`drop-zone ${dragOver ? 'dragging' : ''} ${isBusy ? 'busy' : ''}`}
       onDragOver={e => { e.preventDefault(); setDragOver(true); }}

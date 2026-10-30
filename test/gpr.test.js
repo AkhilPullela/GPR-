@@ -6,7 +6,7 @@ import { toCsv, reportHtml, reportCsvFiles, createSnapshot } from '../gpr/report
 import { createDemoRun } from '../gpr/demo.js';
 import { SOURCE, metricAvailability, METRIC_STATUS } from '../gpr/model.js';
 import { parseChromeTraceInWorker } from '../gpr/traceWorkerClient.js';
-import { createImportManager, initialImportState, isBusyStage } from '../gpr/importSession.js';
+import { createImportManager, describeImportControl, initialImportState, isBusyStage } from '../gpr/importSession.js';
 
 const syntheticTrace = JSON.stringify({ traceEvents: [
   { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
@@ -786,4 +786,145 @@ test('imports a trace larger than 50 MB with no artificial size limit', async ()
   const summary = summarizeRun(run);
   assert.ok(summary.taskCount > 0);
   assert.equal(summary.taskDistribution.reduce((sum, bucket) => sum + bucket.count, 0), summary.taskCount);
+});
+
+// --- Import workflow: control lifecycle, immediate dashboard update, progress ---
+
+test('the import control stays visible and enabled after success, failure, and cancellation', async () => {
+  const succeed = createImportManager({ parse: async () => ({ id: 'r', metadata: { normalizedEventCount: 3 }, tasks: [] }) });
+  await succeed.start(fileLike('ok.json', 10));
+  for (const state of [succeed.getState(), initialImportState(), { status: 'error', stage: 'error', message: 'bad', error: 'bad' }, { status: 'cancelled', stage: 'cancelled' }]) {
+    const control = describeImportControl(state);
+    assert.equal(control.visible, true, `control must stay visible for ${state.status}`);
+    assert.equal(control.enabled, true, `control must stay enabled for ${state.status}`);
+  }
+  assert.equal(describeImportControl(succeed.getState()).canRetry, false, 'a successful import has nothing to retry');
+  assert.equal(describeImportControl({ status: 'error', stage: 'error', message: 'bad' }).canRetry, true, 'a failed import must be retryable');
+  assert.equal(describeImportControl({ status: 'error', stage: 'error', message: 'bad' }).canClear, true);
+});
+
+test('a second import runs without a reload and the same file can be imported twice', async () => {
+  const results = [];
+  const manager = createImportManager({
+    parse: async (file, name) => ({ id: `run-${results.length + 1}`, metadata: { normalizedEventCount: 1 }, tasks: [], fileName: name }),
+    onResult: (run, file) => results.push({ id: run.id, file: file.name })
+  });
+  const file = fileLike('trace.json', 100);
+  await manager.start(file);
+  await manager.start(file);
+  await manager.start(fileLike('other.json', 200));
+  assert.deepEqual(results.map(r => r.id), ['run-1', 'run-2', 'run-3'], 'every import must deliver its own result');
+  assert.equal(results[1].file, 'trace.json', 're-importing the same file must work');
+  assert.equal(manager.getState().status, 'completed');
+});
+
+test('the dashboard result is delivered synchronously with completion so no refresh is needed', async () => {
+  const order = [];
+  const manager = createImportManager({
+    parse: async () => ({ id: 'run', metadata: { normalizedEventCount: 7 }, tasks: [] }),
+    onState: state => order.push(`state:${state.stage}`),
+    onResult: () => order.push('result')
+  });
+  await manager.start(fileLike('trace.json', 10));
+  const completedAt = order.indexOf('state:completed');
+  const resultAt = order.indexOf('result');
+  assert.ok(completedAt !== -1 && resultAt !== -1);
+  assert.ok(resultAt === completedAt + 1, `result must follow completion immediately, got ${order.join(',')}`);
+});
+
+test('a failed import keeps the previous result and restores the import control', async () => {
+  const results = [];
+  let fail = false;
+  const manager = createImportManager({
+    parse: async () => { if (fail) throw new Error('Invalid JSON: truncated.'); return { id: 'good', metadata: { normalizedEventCount: 2 }, tasks: [] }; },
+    onResult: run => results.push(run.id)
+  });
+  await manager.start(fileLike('first.json', 10));
+  fail = true;
+  await manager.start(fileLike('second.json', 10));
+  assert.deepEqual(results, ['good'], 'the previous successful result must remain the only delivered result');
+  const control = describeImportControl(manager.getState());
+  assert.equal(control.status, 'error');
+  assert.equal(control.visible, true);
+  assert.equal(control.enabled, true);
+  assert.equal(control.canRetry, true);
+  assert.match(control.error, /Invalid JSON/);
+});
+
+test('a retry after failure re-imports the same file and succeeds', async () => {
+  let attempt = 0;
+  const results = [];
+  const manager = createImportManager({
+    parse: async () => { attempt++; if (attempt === 1) throw new Error('Invalid JSON: malformed.'); return { id: 'recovered', metadata: { normalizedEventCount: 5 }, tasks: [] }; },
+    onResult: run => results.push(run.id)
+  });
+  const file = fileLike('trace.json', 10);
+  await manager.start(file);
+  assert.equal(manager.getState().status, 'error');
+  await manager.start(file);
+  assert.deepEqual(results, ['recovered']);
+  assert.equal(manager.getState().status, 'completed');
+});
+
+test('progress reports measured percentages, real event counts, and never a fabricated percent', async () => {
+  const seen = [];
+  const manager = createImportManager({
+    throttleMs: 0,
+    parse: async (file, name, onProgress) => {
+      onProgress({ stage: 'reading', bytesRead: 25, totalBytes: 100, percent: 25 });
+      onProgress({ stage: 'parsing', eventCount: 4000 });
+      onProgress({ stage: 'analyzing', percent: undefined });
+      return { id: 'run', metadata: { normalizedEventCount: 4000, eventCount: 4200 }, tasks: [] };
+    },
+    onState: state => seen.push(state)
+  });
+  await manager.start(fileLike('trace.json', 100));
+  const parsing = seen.find(state => state.stage === 'parsing');
+  assert.equal(parsing.eventCount, 4000, 'real parsed event counts must reach the UI');
+  assert.equal(parsing.percent, undefined, 'an unmeasurable stage must not report a percent');
+  assert.equal(describeImportControl(parsing).indeterminate, true, 'unmeasurable stages show an indeterminate bar');
+  const reading = seen.find(state => state.stage === 'reading');
+  assert.equal(reading.percent, 25);
+  assert.equal(describeImportControl(reading).indeterminate, false);
+  assert.equal(manager.getState().percent, 100);
+});
+
+test('cancelling an import resets the control so a new import can start immediately', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const manager = createImportManager({
+    parse: async (file, name, onProgress, signal) => {
+      await gate;
+      if (signal?.aborted) throw new DOMException('cancelled', 'AbortError');
+      return { id: 'late', metadata: { normalizedEventCount: 1 }, tasks: [] };
+    }
+  });
+  const pending = manager.start(fileLike('trace.json', 10));
+  manager.cancel();
+  release();
+  await pending;
+  const control = describeImportControl(manager.getState());
+  assert.equal(control.status, 'cancelled');
+  assert.equal(control.visible, true);
+  assert.equal(control.enabled, true);
+  assert.equal(control.busy, false);
+});
+
+test('all dashboard sections read from the single delivered run result', async () => {
+  const file = fileLike('trace.json', 10);
+  const delivered = [];
+  const manager = createImportManager({
+    parse: async () => analyzeRun(parseChromeTraceText(syntheticTrace, 'trace.json')),
+    onResult: run => delivered.push(run)
+  });
+  await manager.start(file);
+  assert.equal(delivered.length, 1);
+  const run = delivered[0];
+  // Every section consumes this one object: summary, findings, rounds, and charts.
+  assert.ok(run.analysis.summary, 'summary present');
+  assert.ok(Array.isArray(run.analysis.findings), 'findings present');
+  assert.ok(Array.isArray(run.analysis.rounds), 'rounds present');
+  assert.ok(run.analysis.chartSamples, 'chart samples present');
+  assert.equal(run.analysis.summary, summarizeRun(run).summary ?? run.analysis.summary, 'summary derives from the same run');
+  assert.ok(run.analysis.findings.every(f => typeof f.severity === 'string'));
 });

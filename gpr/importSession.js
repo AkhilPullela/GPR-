@@ -45,6 +45,47 @@ export const STAGE_DETAIL = Object.freeze({
 
 export function isBusyStage(stage) { return BUSY_STAGES.includes(stage); }
 
+/**
+ * Single source of truth for what the import control should render.
+ *
+ * The control is intentionally always `visible` and always `enabled`: a new
+ * file selection supersedes an in-flight import instead of being blocked, and a
+ * completed or failed import must never hide or permanently disable it. Keeping
+ * this as a pure function lets the UI stay a thin renderer and lets tests assert
+ * the invariant across every terminal state.
+ */
+export function describeImportControl(state = initialImportState()) {
+  const busy = isBusyStage(state.stage);
+  const percent = Number.isFinite(state.percent) ? state.percent : undefined;
+  const failed = state.status === 'error';
+  const cancelled = state.status === 'cancelled';
+  const terminal = state.status === 'completed' || failed || cancelled;
+  return {
+    visible: true,
+    enabled: true,
+    busy,
+    terminal,
+    status: state.status,
+    stage: state.stage,
+    label: busy ? 'Importing…' : 'Import trace',
+    stageLabel: STAGE_LABEL[state.stage] || STAGE_LABEL[state.status] || 'Idle',
+    detail: busy ? (STAGE_DETAIL[state.stage] || '') : '',
+    message: state.message || '',
+    error: failed ? (state.error || state.message || '') : '',
+    fileName: state.fileName || '',
+    fileSize: state.fileSize,
+    percent,
+    // An indeterminate bar is shown only while processing without a measurable
+    // percentage. A percentage is never invented for stages that cannot measure it.
+    indeterminate: busy && percent === undefined,
+    eventCount: Number.isFinite(state.eventCount) ? state.eventCount : undefined,
+    elapsedMs: busy ? state.elapsedMs : undefined,
+    canCancel: busy && state.canCancel !== false,
+    canRetry: failed && state.canRetry !== false,
+    canClear: terminal
+  };
+}
+
 export function initialImportState() {
   return {
     status: 'idle',

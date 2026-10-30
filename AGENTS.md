@@ -34,7 +34,9 @@ react, react-dom, vite, and @vitejs/plugin-react.
   `METRIC_STATUS.FAILED` means a metric-shaped event existed but could not be parsed;
   it must never be collapsed into `NOT_CAPTURED`.
 - `gpr/importSession.js` — UI-independent import state machine (sequencing, throttled
-  progress, cancellation, failure-preserves-previous-report).
+  progress, cancellation, failure-preserves-previous-report) plus
+  `describeImportControl(state)`, the single source of truth for the import control's
+  visibility, enablement, stage label, measured percent, and indeterminate flag.
 - `gpr/trace.worker.js` + `gpr/traceWorkerClient.js` — all parsing and analysis run in a
   Web Worker so the UI thread never blocks. Keep expensive work out of React render.
 - `gpr/reports.js` — HTML/PDF/CSV exports from one memoized snapshot.
@@ -60,6 +62,20 @@ react, react-dom, vite, and @vitejs/plugin-react.
   bonus names, or boundaries.
 - Temporal overlap is a lead, not causation. Heap growth is not proof of a leak.
 - Demo fixture output is always labelled DEMO DATA — NOT MEASURED, including in exports.
+
+## Import workflow invariants
+
+- The import control is always visible and always enabled, in every state (idle, busy,
+  completed, error, cancelled). It must never be hidden when a run exists and never
+  permanently disabled after a success or failure.
+- `importTrace` records the attempted file *before* starting, because `onResult` only
+  fires on success. Without this, Retry after a first-import failure has nothing to retry.
+- `onResult` applies the new run in one state update and is called immediately after the
+  `completed` transition, so the dashboard never needs a refresh or navigation.
+- Progress is rendered by `GlobalImportProgress` in the app shell, not inside a page, so
+  it is visible on every route including the empty state where no page panel is mounted.
+- A failed import leaves the previous successful run in place and only updates the notice.
+- A percent is shown only when the stage measures it; otherwise the bar is indeterminate.
 
 ## Testing conventions
 
