@@ -36,7 +36,7 @@ export function createDemoRun() {
     { id: 'demo-react', category: 'react-redux', severity: 'info', title: 'Repeated instrumented renders', observed: 'Illustrative instrumentation finding of 38 ms.', interpretation: 'Measured work, not proof of causation.', impact: 'Competes with rendering for the frame budget.', description: 'Illustrative instrumentation finding; component identity is intentionally not asserted.', roundId: 9, value: 38, unit: 'ms', threshold: 16.67, rule: 'reactCommitMs >= 16.67', recurrence: 2, evidenceQuality: 'measured', evidenceNote: 'Synthetic fixture value.', investigation: ['Identify the committing subtree.'], evidence: [] }
   ];
   return {
-    id: 'demo-zeus-32-rounds', game: 'Zeus vs Hades', buildId: 'demo-build-2025.04', environment: 'Synthetic desktop / 60 Hz target', startedAt: new Date(started).toISOString(), source: SOURCE.DEMO,
+    id: 'demo-zeus-32-rounds', game: 'zeus', buildId: 'demo-build-2025.04', environment: 'Synthetic desktop / 60 Hz target', startedAt: new Date(started).toISOString(), source: SOURCE.DEMO,
     samples, events, findings, tasks: [], metadata: {
       browser: 'Synthetic fixture',
       roundCount: rounds,

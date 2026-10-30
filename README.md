@@ -1,6 +1,6 @@
 # Game Performance Reporter (GPR)
 
-A browser-side engineering dashboard for investigating manually captured Zeus vs Hades performance runs. The current project extends the existing React/Vite application and uses browser-native SVG, File APIs, Web Workers, and print styles rather than adding UI/chart dependencies.
+A browser-side engineering dashboard for investigating manually captured  performance runs. The current project extends the existing React/Vite application and uses browser-native SVG, File APIs, Web Workers, and print styles rather than adding UI/chart dependencies.
 
 ## What is implemented
 
@@ -12,7 +12,7 @@ A browser-side engineering dashboard for investigating manually captured Zeus vs
 - Shared analysis and report snapshot modules, trace evidence references, metric-coverage status, round summaries, and prioritized findings with explicit, overridable rules.
 - Simple and Technical detail views backed by the same analysis data, plus accessible inline definitions for technical terms (`gpr/glossary.js`).
 - Standalone HTML export with inline SVG charts and page numbers; print-ready HTML for the browser's **Save as PDF** workflow; four separate CSV exports (rounds, time-series samples, findings, and game events).
-- Optional, bounded React Profiler callback and Redux-compatible timing middleware helpers in `gpr/instrumentation.js`. These are not connected to the Zeus vs Hades application.
+- Optional, bounded React Profiler callback and Redux-compatible timing middleware helpers in `gpr/instrumentation.js`. These are not connected to the  application.
 - A Node built-in test suite in `test/gpr.test.js` (34 tests); its trace samples are clearly synthetic, not real Chrome recordings.
 
 ## Workspace usage
@@ -113,7 +113,7 @@ All exports are produced from a single snapshot of the currently analyzed run, s
 
 `gpr/instrumentation.js` supplies disabled-by-default bounded recording helpers, a React Profiler callback factory, a Redux-compatible middleware, sampling, and basic recorder-overhead accounting. It avoids storing state or action payloads. Integrating it requires a development/test build of the game, Profiler boundaries around selected subtrees, and explicit run/round context. React Profiler does not identify every component or prove causation. Redux notification and selector timing require application-specific instrumentation. Compare representative profiling-disabled and profiling-enabled runs to understand overhead.
 
-Automatic browser capture / CDP runner is **not implemented**. The dashboard does not execute shell commands. The working workflow is manual Chrome trace export and import. No Zeus vs Hades game code or shared Core was changed.
+Automatic browser capture / CDP runner is **not implemented**. The dashboard does not execute shell commands. The working workflow is manual Chrome trace export and import. No  game code or shared Core was changed.
 
 ## Testing and remaining work
 
@@ -128,4 +128,4 @@ Verified in this environment (Node v24, vite 5.4.21, React 19.2.7):
 - The application was rendered in a browser with the synthetic fixture loaded; the Overview four-KPI layout, availability statuses, diagnostics panel, and term popovers displayed without runtime errors.
 - Large-file handling was verified with synthetic fixtures generated in-process (over 50 MiB, streamed in chunks). A real Chrome DevTools recording was not available in this repository, so validation against real-world trace variants remains outstanding. The browser tool used here cannot set a file on a `<input type=file>`, so the in-browser import path was exercised through the worker-level tests rather than a manual file pick.
 
-Remaining integration work requires access to a real Zeus vs Hades build and recordings: validate actual trace event naming, provide trustworthy CPU/heap/frame sources where absent, instrument explicit game markers, connect and overhead-test the optional React/Redux helpers, implement multi-run baseline selection, and evaluate automatic CDP capture if the repository later adopts a suitable maintained integration.
+Remaining integration work requires access to a real  build and recordings: validate actual trace event naming, provide trustworthy CPU/heap/frame sources where absent, instrument explicit game markers, connect and overhead-test the optional React/Redux helpers, implement multi-run baseline selection, and evaluate automatic CDP capture if the repository later adopts a suitable maintained integration.

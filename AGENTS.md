@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Repository-specific guidance for the Zeus vs Hades Game Performance Reporter (GPR).
+Repository-specific guidance for the  Game Performance Reporter (GPR).
 
 ## What this is
 

@@ -320,7 +320,7 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     if (droppedTotal) limitations.push(`${droppedTotal} measurement(s) exceeded the bounded retention limit and were summarized only by counts: ${dropped.frames} frame event(s), ${dropped.heapSamples} heap sample(s), ${dropped.tasks} task candidate(s), ${dropped.busyIntervals} busy interval(s).`);
 
     const run = {
-      id: `trace-${Date.now()}`, game: 'Zeus vs Hades',
+      id: `trace-${Date.now()}`, game: 'Toddler',
       buildId,
       environment,
       startedAt: new Date().toISOString(), source: SOURCE.TRACE,
