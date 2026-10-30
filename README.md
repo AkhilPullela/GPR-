@@ -25,6 +25,26 @@ The project retains its existing Vite setup and package scripts. Run `npm run de
 2. **The 50 MB import limit.** The limit is gone. The file is read once as a stream, parsing runs in a Web Worker, and retained data is bounded per category (frames, heap samples, task candidates) with overflow counted and surfaced as a limitation rather than dropped silently.
 3. **`Preview stopped: a loop ran longer than 400ms`.** The original design decoded the whole file and normalized every event on the UI thread, which starves the render loop. Parsing and analysis now run in a Web Worker, the UI only renders aggregated/downsampled series (≤1200 points per metric), and findings/round tables are capped with an explicit "showing N of M" note. The preview warning was a symptom of main-thread starvation, not a separate application bug.
 
+### Imported results not appearing (fixed)
+
+The dashboard previously updated only after a full reload. Two defects caused this and both are fixed:
+
+- The file input kept its value after a selection, so choosing the same file again never fired a change event. File inputs now reset their value on every selection (`TraceFileInput`), so repeat imports and retries work.
+- The result handoff was spread across several state updates with no ordering guarantee. A single import manager (`gpr/importSession.js`) now owns the lifecycle: it sequences each import, ignores results from a superseded import, and delivers the analyzed run through one callback that sets the run and resets dependent view state atomically. A failed import leaves the previous successful report in place and offers **Retry**.
+
+### Metrics always showing empty (fixed)
+
+CPU, heap, React, and Redux areas could render empty even for a valid trace. The causes and fixes:
+
+- **Heap** was keyed only on some counter shapes. Chrome writes heap counters as `ph: "C"` `UpdateCounters` events with `args.data.jsHeapSizeUsed`. That key is now recognized, so heap samples are extracted instead of reported as missing.
+- **Main-thread tasks** were filtered using `thread_name` metadata that Chrome sometimes writes *after* the tasks. The filter is now deferred to the end of normalization, so a trailing `thread_name` still classifies the thread. When no main-thread metadata exists at all, task metrics are reported as **Not captured** with an explanation rather than shown as zero.
+- **Main-thread busy time** is now derived from merged task intervals (`mergeIntervals`), so nested or overlapping work is counted once. It is labelled as derived-from-tasks and kept strictly separate from CPU utilization, which is never invented.
+- **React / Redux** data cannot exist in a Chrome trace, so that area now states it is **Not captured** and explains how to obtain it, instead of displaying zeros. The same availability status (`METRIC_STATUS`, `metricAvailability`) drives every KPI, the coverage grid, and a new **Trace diagnostics** panel that lists event counts, phases, categories, process/thread coverage, and every metric that could not be recovered.
+
+### Import progress (fixed)
+
+Progress is now a real state machine (`IMPORT_STAGES`) reported from the worker: validating → reading → parsing → normalizing → analyzing → findings → preparing → completed, with cancelled and error terminals. A measured percentage is shown only while reading, where bytes read is known; later stages show an indeterminate bar and a short explanation instead of a fake percentage. Elapsed time, file name/size, cancel, and retry are all surfaced, and progress notifications are throttled so React never re-renders once per trace event.
+
 ## Manual trace workflow
 
 1. Capture a Performance recording in Chrome DevTools and export it as a JSON trace.
@@ -97,13 +117,15 @@ Automatic browser capture / CDP runner is **not implemented**. The dashboard doe
 
 ## Testing and remaining work
 
-`npm test` runs 34 Node built-in tests. They cover: successful small trace import; a valid trace above 50 MiB that is not size-rejected and still extracts real measurements; malformed, truncated, and empty inputs; unsupported wrapper shapes; parser chunk boundaries (including 1-byte chunks and escaped strings); repeated imports; cancellation; progress and completion signals; frame intervals and heap counters; missing metrics; round aggregation and incomplete boundaries; finding repeatability, ranking, rules, and evidence links; chart downsampling; and report/CSV consistency.
+`npm test` runs 55 Node built-in tests across two files. `test/gpr.test.js` covers: successful small trace import; a valid trace above 50 MiB that is not size-rejected and still extracts real measurements; malformed, truncated, and empty inputs; unsupported wrapper shapes; parser chunk boundaries (including 1-byte chunks and escaped strings); repeated imports; cancellation; progress and completion signals; frame intervals and heap counters; missing metrics; round aggregation and incomplete boundaries; finding repeatability, ranking, rules, and evidence links; chart downsampling; and report/CSV consistency. `test/worker.test.js` drives the real worker entry point (`gpr/trace.worker.js`) with a `self` shim, covering the stream → parse → analyze → post chain, staged progress ordering, and truncation/empty/non-JSON error messages.
+
+Additional coverage added for this round: heap extraction from `UpdateCounters`/`jsHeapSizeUsed`; busy-time merging that avoids double-counting nested tasks and stays distinct from CPU; main-thread filtering with trailing `thread_name` metadata; honest availability for absent CPU/heap/React/Redux; bounded category/phase/interval diagnostics; import state delivery without a reload; full stage progression; newest-import-wins ordering; failure preserving the previous report with retry; cancellation; validation-before-parse for unsupported and empty files; repeated imports of the same file; and progress throttling.
 
 Verified in this environment (Node v24, vite 5.4.21, React 19.2.7):
 
-- `npm test` — 34/34 passing.
-- `npm run build` — production bundle built successfully (35 modules).
-- The application was rendered in a browser with the synthetic fixture loaded; the Overview, Traces, and Round pages and the term popovers displayed without runtime errors.
-- Large-file handling was verified with synthetic fixtures generated in-process (over 50 MiB, streamed in 1 MiB chunks). A real Chrome DevTools recording was not available in this repository, so validation against real-world trace variants remains outstanding.
+- `npm test` — 55/55 passing.
+- `npm run build` — production bundle built successfully.
+- The application was rendered in a browser with the synthetic fixture loaded; the Overview four-KPI layout, availability statuses, diagnostics panel, and term popovers displayed without runtime errors.
+- Large-file handling was verified with synthetic fixtures generated in-process (over 50 MiB, streamed in chunks). A real Chrome DevTools recording was not available in this repository, so validation against real-world trace variants remains outstanding. The browser tool used here cannot set a file on a `<input type=file>`, so the in-browser import path was exercised through the worker-level tests rather than a manual file pick.
 
 Remaining integration work requires access to a real Zeus vs Hades build and recordings: validate actual trace event naming, provide trustworthy CPU/heap/frame sources where absent, instrument explicit game markers, connect and overhead-test the optional React/Redux helpers, implement multi-run baseline selection, and evaluate automatic CDP capture if the repository later adopts a suitable maintained integration.

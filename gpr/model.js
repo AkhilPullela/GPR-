@@ -40,16 +40,112 @@ export function validateRun(run) {
   return run;
 }
 
-export function metricCoverage(run) {
-  const has = key => run.samples.some(sample => Number.isFinite(sample[key]));
+/**
+ * Status of one dashboard metric. `captured` and `partial` are the only two
+ * states that may render a measurement; the rest must render an explanation
+ * instead of a zero.
+ */
+export const METRIC_STATUS = Object.freeze({
+  CAPTURED: 'captured',
+  PARTIAL: 'partial',
+  NOT_CAPTURED: 'not-captured',
+  UNSUPPORTED: 'unsupported',
+  FAILED: 'processing-failed'
+});
+
+export const METRIC_STATUS_LABEL = Object.freeze({
+  captured: 'Captured',
+  partial: 'Partial',
+  'not-captured': 'Not captured',
+  unsupported: 'Unsupported',
+  'processing-failed': 'Processing failed'
+});
+
+/** Metrics that render as a real measurement. */
+export const AVAILABLE_STATUSES = Object.freeze([METRIC_STATUS.CAPTURED, METRIC_STATUS.PARTIAL]);
+
+/**
+ * Metric availability diagnostics.
+ *
+ * Every dashboard metric reports a status, the reason for that status, whether
+ * it could be recovered from the current trace, and what recording setting or
+ * instrumentation would capture it next time. Nothing here fabricates a value:
+ * an absent measurement is `not-captured` or `unsupported`, never zero.
+ */
+export function metricAvailability(run) {
+  const samples = run.samples || [];
+  const tasks = run.tasks || [];
+  const events = run.events || [];
+  const diagnostics = run.metadata?.diagnostics || {};
+  const count = key => samples.reduce((total, sample) => total + (Number.isFinite(sample[key]) ? 1 : 0), 0);
+  const hasRounds = events.some(event => event.type === 'roundStart' || event.type === 'roundEnd');
+
+  const busyCount = count('mainThreadBusyPercent');
+  const heapCount = count('jsHeapUsedBytes');
+  const frameCount = count('frameDurationMs') + count('fps');
+  const cpuCount = count('cpuPercent');
+  const reactCount = count('reactCommitMs') + count('dispatchDurationMs');
+
+  const entry = (status, reason, howToCapture, sampleCount, extra = {}) => ({
+    status,
+    label: METRIC_STATUS_LABEL[status],
+    available: AVAILABLE_STATUSES.includes(status),
+    reason,
+    note: reason,
+    howToCapture,
+    sampleCount,
+    ...extra
+  });
+
+  const mainThread = run.metadata?.mainThreadDetected;
+  const busy = busyCount > 0
+    ? entry(METRIC_STATUS.CAPTURED, `Main-thread busy time measured in ${busyCount} window(s). This is not CPU utilization.`, 'Already captured. Busy time needs main-thread task events with thread metadata.', busyCount, { distinctFromCpu: true })
+    : tasks.length > 0
+      ? entry(METRIC_STATUS.PARTIAL, 'Main-thread tasks were found but no usable busy-time windows could be derived.', 'Export a longer trace so busy-time windows can be computed.', 0)
+      : entry(METRIC_STATUS.NOT_CAPTURED, mainThread === false ? 'Renderer main-thread metadata (CrRendererMain) was not identified, so main-thread work cannot be isolated.' : 'No main-thread task events were present in this trace.', 'Record with the Performance panel so main-thread tasks are included, and keep thread_name metadata in the export.', 0);
+
+  const cpu = cpuCount > 0
+    ? entry(METRIC_STATUS.CAPTURED, 'Explicit utilization samples were present in this trace.', 'Already captured.', cpuCount)
+    : entry(METRIC_STATUS.UNSUPPORTED, 'Chrome DevTools traces do not record CPU utilization. Task duration is not CPU percent, so no value is shown.', 'Use an operating-system or device profiler for utilization. Main-thread busy time is reported separately as a trace-derived proxy.', 0);
+
+  const frames = frameCount > 0
+    ? entry(frameCount >= 2 ? METRIC_STATUS.CAPTURED : METRIC_STATUS.PARTIAL, frameCount >= 2 ? 'Frame timing derived from recognized frame events.' : 'Only one frame sample was found, so no frame interval can be computed.', 'Record with the Performance panel so frame markers (FireAnimationFrame/DrawFrame) are included.', frameCount)
+    : entry(METRIC_STATUS.NOT_CAPTURED, 'No recognized frame timing events were found.', 'Record a trace that includes rendering frames, and keep DrawFrame/FireAnimationFrame events in the export.', 0);
+
+  const memory = heapCount > 0
+    ? entry(heapCount >= 2 ? METRIC_STATUS.CAPTURED : METRIC_STATUS.PARTIAL, heapCount >= 2 ? 'JavaScript heap samples available. Growth alone is not proof of a leak.' : 'A single heap sample was found, so no trend can be computed.', 'Record with the Memory checkbox enabled so UpdateCounters events are captured.', heapCount)
+    : entry(METRIC_STATUS.NOT_CAPTURED, 'No supported JavaScript heap counter samples were found.', 'Enable the Memory checkbox in the Performance panel and re-capture so UpdateCounters (jsHeapSizeUsed) events are recorded.', 0);
+
+  const react = reactCount > 0
+    ? entry(METRIC_STATUS.CAPTURED, 'Instrumented React/Redux samples were present.', 'Already captured.', reactCount)
+    : entry(METRIC_STATUS.NOT_CAPTURED, 'Browser traces do not contain React component or Redux dispatch timings.', 'Enable the optional QA-only React Profiler / Redux instrumentation adapter for a development run, then re-capture and re-import.', 0);
+
+  const rounds = hasRounds
+    ? entry(METRIC_STATUS.CAPTURED, 'Round intervals correlated from explicit game markers.', 'Already captured.', events.length)
+    : entry(METRIC_STATUS.NOT_CAPTURED, 'Round boundaries require explicit, clock-aligned game markers; they are never inferred from trace timing.', 'Import a marker sidecar aligned to the trace clock on the Traces page.', 0);
+
+  const taskEntry = tasks.length > 0
+    ? entry(METRIC_STATUS.CAPTURED, 'Main-thread task durations extracted. Task time is not CPU utilization.', 'Already captured.', tasks.length)
+    : entry(METRIC_STATUS.NOT_CAPTURED, mainThread === false ? 'Main-thread metadata was not identified, so task coverage may be incomplete.' : 'No main-thread task durations were detected.', 'Record with the Performance panel and keep thread_name metadata in the export.', 0);
+
   return {
-    cpuPercent: { available: has('cpuPercent'), note: has('cpuPercent') ? 'Explicit utilization measurements' : 'Trace task duration is not CPU utilization.' },
-    frames: { available: has('fps') || has('frameDurationMs'), note: has('fps') || has('frameDurationMs') ? 'Frame timing observed where supported' : 'No supported frame timing events found.' },
-    memory: { available: has('jsHeapUsedBytes'), note: has('jsHeapUsedBytes') ? 'Heap samples available; growth is not proof of a leak.' : 'No supported JavaScript heap samples found.' },
-    reactRedux: { available: run.samples.some(s => Number.isFinite(s.reactCommitMs) || Number.isFinite(s.dispatchDurationMs)), note: 'Requires optional application instrumentation.' },
-    rounds: { available: run.events.some(e => e.type === 'roundStart' || e.type === 'roundEnd'), note: run.events.some(e => e.type === 'roundStart') ? 'Correlated from explicit game markers.' : 'Round analysis unavailable without valid markers.' },
-    tasks: { available: run.tasks?.length > 0, note: run.tasks?.length ? 'Main-thread task activity; not system CPU utilization.' : 'No main-thread task durations detected.' }
+    mainThreadBusy: busy,
+    cpuPercent: cpu,
+    frames,
+    memory,
+    reactRedux: react,
+    rounds,
+    tasks: taskEntry,
+    ...(diagnostics.processingFailed ? { __failed: diagnostics.processingFailed } : {})
   };
+}
+
+/** Backwards-compatible compact coverage map derived from the availability data. */
+export function metricCoverage(run) {
+  const availability = run.metadata?.availability || metricAvailability(run);
+  return Object.fromEntries(Object.entries(availability)
+    .filter(([key]) => !key.startsWith('__'))
+    .map(([key, info]) => [key, { available: info.available, note: info.reason, status: info.status }]));
 }
 
 export function displayValue(value, digits = 1) {

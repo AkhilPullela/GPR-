@@ -3,9 +3,9 @@ import { analyzeRun } from './analyze.js';
 
 const post = (stage, message, extra = {}) => self.postMessage({ type: 'progress', stage, message, ...extra });
 
-function attachAnalysis(run) {
+function attachAnalysis(run, onStage) {
   run.metadata = { ...run.metadata, markedRoundCount: new Set(run.events.map(marker => marker.roundId)).size };
-  return analyzeRun(run);
+  return analyzeRun(run, {}, onStage ? { onStage } : {});
 }
 
 function correlateMarkers(run, fileName, markers) {
@@ -79,20 +79,25 @@ self.onmessage = async event => {
       post('parsing', 'Reading game markers…');
       const markers = parseMarkerText(await file.text(), run.metadata?.traceOriginUs || 0);
       post('analyzing', 'Correlating markers with rounds…');
-      self.postMessage({ type: 'result', run: correlateMarkers(run, file.name || fileName, markers) });
+      const updated = correlateMarkers(run, file.name || fileName, markers);
+      post('preparing', 'Preparing dashboard data…');
+      self.postMessage({ type: 'result', run: updated });
       return;
     }
+    post('validating', 'Validating trace file…');
     post('reading', 'Reading and validating trace JSON…');
     let lastPercent = -1;
     const parsed = await parseChromeTraceFile(file, fileName, ({ bytesRead, totalBytes, complete }) => {
-      if (complete) { post('parsing', 'Trace read; normalizing events…', { percent: 100 }); return; }
+      if (complete) { post('parsing', 'Trace read; parsing events…', { percent: 100 }); return; }
       const percent = totalBytes ? Math.min(100, Math.floor(bytesRead / totalBytes * 100)) : 0;
       if (percent > lastPercent) { lastPercent = percent; post('reading', `Reading trace file… ${percent}%`, { percent, bytesRead, totalBytes }); }
     });
-    post('analyzing', 'Calculating summaries, rounds, and findings…');
-    const analyzed = attachAnalysis(parsed);
+    // Analysis runs inside this worker, so the UI thread never blocks. Stage
+    // callbacks and the abort check keep progress honest and cancellation real.
+    const analyzed = attachAnalysis(parsed, (stage, message) => post(stage, message));
     self.postMessage({ type: 'result', run: analyzed });
   } catch (error) {
+    if (error?.name === 'AbortError') { self.postMessage({ type: 'error', cancelled: true, message: 'Trace processing was cancelled.' }); return; }
     const message = error?.name === 'QuotaExceededError' || error?.name === 'RangeError'
       ? 'The browser ran out of memory while processing this trace. The original file was not modified. Reduce the recording time range in DevTools and export again.'
       : error?.message || 'Trace parsing failed.';

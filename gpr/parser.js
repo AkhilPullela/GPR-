@@ -3,7 +3,7 @@ import { JsonTokenReader, MalformedJsonError, TruncatedJsonError } from './jsonS
 
 const num = value => value !== null && value !== undefined && value !== '' && typeof value !== 'boolean' && Number.isFinite(Number(value)) ? Number(value) : undefined;
 
-const FRAME_NAMES = /^(DrawFrame|Frame|SubmitCompositorFrame|FireAnimationFrame|BeginFrame|PipelineReporter|Graphics\.Pipeline|FramePresented)$/i;
+const FRAME_NAMES = /^(DrawFrame|Frame|SubmitCompositorFrame|FireAnimationFrame|BeginFrame|PipelineReporter|Graphics\.Pipeline|FramePresented|AnimationFrame)$/i;
 const TASK_NAMES = /^(RunTask|ThreadControllerImpl::RunTask|TaskQueueManager::ProcessTask|EvaluateScript|FunctionCall|v8\.compile|UpdateLayoutTree|Layout|Paint|CompositeLayers)$/i;
 const HEAP_NAMES = /heap|memory|v8\.gc|jsHeap/i;
 const MAIN_THREAD_NAMES = /CrRendererMain|RendererMain|Main Thread/i;
@@ -11,7 +11,10 @@ const MAIN_THREAD_NAMES = /CrRendererMain|RendererMain|Main Thread/i;
 // Bounds keep peak memory predictable on very large recordings. Anything that
 // exceeds a bound is counted and surfaced in trace diagnostics rather than
 // silently discarded.
-const LIMITS = Object.freeze({ frames: 750000, heapSamples: 750000, tasks: 400000 });
+const LIMITS = Object.freeze({ frames: 750000, heapSamples: 750000, tasks: 400000, busyIntervals: 400000 });
+
+/** Window used to convert main-thread busy intervals into a percentage series. */
+const BUSY_WINDOW_MS = 1000;
 
 const hash32 = (text, seed) => {
   let hash = seed >>> 0;
@@ -38,7 +41,10 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
   const frames = [];
   const heap = [];
   const taskCandidates = [];
-  const dropped = { frames: 0, heapSamples: 0, tasks: 0 };
+  const busyIntervals = [];
+  const dropped = { frames: 0, heapSamples: 0, tasks: 0, busyIntervals: 0 };
+  const categories = new Map();
+  const phases = new Map();
 
   let eventCount = 0, normalizedEventCount = 0, malformedTimestampCount = 0, duplicateEventCount = 0;
   let unmatchedEndCount = 0, incompleteBeginCount = 0, mainThreadDurationCount = 0;
@@ -65,7 +71,9 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     }
     if (event.ph === 'C' || HEAP_NAMES.test(name)) {
       const args = { ...(event.args || {}), ...(event.args?.data || {}) };
-      const heapBytes = num(args.usedHeapSize ?? args.jsHeapUsedSize ?? args.jsHeapUsedBytes ?? args.used_bytes);
+      // Chrome writes heap counters as jsHeapSizeUsed inside args.data; other
+      // Chromium versions and DevTools SDK exports use the remaining aliases.
+      const heapBytes = num(args.jsHeapSizeUsed ?? args.usedHeapSize ?? args.jsHeapUsedSize ?? args.jsHeapUsedBytes ?? args.used_bytes ?? args.usedHeapSizeBytes);
       if (heapBytes !== undefined && heapBytes >= 0) {
         if (heap.length < limits.heapSamples) heap.push({ ts: timestampUs, bytes: heapBytes, pid: event.pid, tid: event.tid, name, cat: event.cat, durationUs });
         else dropped.heapSamples++;
@@ -74,6 +82,14 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     if (durationUs / 1000 >= 50 || TASK_NAMES.test(name)) {
       if (taskCandidates.length < limits.tasks) taskCandidates.push({ ts: timestampUs, durationUs, name, pid: event.pid, tid: event.tid, cat: event.cat, threadKey });
       else dropped.tasks++;
+    }
+    // Main-thread busy intervals are recorded from the same evidence as tasks so
+    // busy time and task lists can never disagree about what was observed. The
+    // main-thread filter is applied in finish(), because thread_name metadata
+    // frequently appears after the events it describes.
+    if (durationUs > 0) {
+      if (busyIntervals.length < limits.busyIntervals) busyIntervals.push({ start: timestampUs, end: timestampUs + durationUs, threadKey });
+      else dropped.busyIntervals++;
     }
   }
 
@@ -85,6 +101,12 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     const signature = signatureFor(rawEvent);
     if (seenSignatures.has(signature)) { duplicateEventCount++; return; }
     seenSignatures.add(signature);
+    // Bounded category/phase histograms for the diagnostics panel.
+    if (categories.size < 200) {
+      const category = rawEvent.cat || '(uncategorized)';
+      categories.set(category, (categories.get(category) || 0) + 1);
+    }
+    if (phases.size < 20 && typeof rawEvent.ph === 'string') phases.set(rawEvent.ph, (phases.get(rawEvent.ph) || 0) + 1);
     if (ts < minTs) minTs = ts;
     if (ts > maxTs) maxTs = ts;
     hasAnyTimestamp = true;
@@ -137,6 +159,52 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
       return;
     }
     if (rawEvent.ph === 'C') emitDuration(rawEvent, ts, 0);
+  }
+
+  /**
+   * Merge overlapping intervals so nested or parallel events are counted once.
+   * A naive sum would double-count nested work and overstate busy time.
+   */
+  function mergeIntervals(intervals) {
+    if (intervals.length < 2) return intervals.map(interval => ({ ...interval }));
+    const sorted = [...intervals].sort((a, b) => a.start - b.start || a.end - b.end);
+    const merged = [{ ...sorted[0] }];
+    for (let i = 1; i < sorted.length; i++) {
+      const last = merged[merged.length - 1];
+      if (sorted[i].start <= last.end) { if (sorted[i].end > last.end) last.end = sorted[i].end; }
+      else merged.push({ ...sorted[i] });
+    }
+    return merged;
+  }
+
+  /** Busy percentage per fixed window, derived from merged main-thread intervals. */
+  function busyWindows(intervals, originUs, spanUs) {
+    if (!intervals.length || !(spanUs > 0)) return [];
+    const windows = [];
+    for (let index = 0; index < intervals.length; index++) {
+      const interval = intervals[index];
+      const startMs = (interval.start - originUs) / 1000;
+      const endMs = (interval.end - originUs) / 1000;
+      const firstWindow = Math.floor(startMs / BUSY_WINDOW_MS);
+      const lastWindow = Math.max(firstWindow, Math.floor((endMs - 0.001) / BUSY_WINDOW_MS));
+      for (let windowIndex = firstWindow; windowIndex <= lastWindow; windowIndex++) {
+        const windowStart = windowIndex * BUSY_WINDOW_MS;
+        const windowEnd = windowStart + BUSY_WINDOW_MS;
+        const overlap = Math.min(endMs, windowEnd) - Math.max(startMs, windowStart);
+        if (overlap <= 0) continue;
+        const bucket = windows[windowIndex] ?? (windows[windowIndex] = { busyMs: 0, events: 0 });
+        bucket.busyMs += overlap;
+        bucket.events++;
+      }
+    }
+    return windows
+      .map((bucket, index) => bucket && ({
+        timestampMs: index * BUSY_WINDOW_MS,
+        mainThreadBusyPercent: Math.min(100, bucket.busyMs / BUSY_WINDOW_MS * 100),
+        busyMs: bucket.busyMs,
+        contributingEvents: bucket.events
+      }))
+      .filter(Boolean);
   }
 
   function finish(meta = {}) {
@@ -192,6 +260,21 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     }
     tasks.sort((a, b) => a.timestampMs - b.timestampMs);
 
+    // Main-thread busy time is resolved after the main thread is known, so a
+    // trailing thread_name metadata event still applies to earlier tasks.
+    const mainThreadIntervals = busyIntervals.filter(interval => mainThreadKey !== undefined && interval.threadKey === mainThreadKey);
+    const mergedIntervals = mergeIntervals(mainThreadIntervals);
+    const busySpanUs = mergedIntervals.length ? mergedIntervals[mergedIntervals.length - 1].end - mergedIntervals[0].start : 0;
+    const busySeries = busyWindows(mergedIntervals, timeOrigin, busySpanUs);
+    for (const window of busySeries) {
+      samples.push({
+        timestampMs: window.timestampMs, mainThreadBusyPercent: window.mainThreadBusyPercent, source: SOURCE.TRACE,
+        evidence: { traceFile: fileName, startUs: timeOrigin + window.timestampMs * 1000, durationUs: window.busyMs * 1000, eventName: 'main-thread busy time', category: 'derived' }
+      });
+    }
+    samples.sort((a, b) => a.timestampMs - b.timestampMs);
+    const busyTotalMs = mergedIntervals.reduce((sum, interval) => sum + (interval.end - interval.start) / 1000, 0);
+
     const threadInfoSet = new Set();
     for (const [key, name] of threadNames) {
       if (threadInfoSet.size >= 80) break;
@@ -201,13 +284,15 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
     if (!threadInfoSet.size) for (const pid of processIds) { if (threadInfoSet.size >= 80) break; threadInfoSet.add(`${pid}:? ${processes.get(pid) || 'process'} / unnamed thread`); }
 
     const limitations = ['Chrome traces generally do not provide whole-system or browser CPU utilization.', 'Game rounds require separately imported, clock-aligned markers.', 'Frame and heap events are extracted only for recognized event shapes.'];
+    if (!mainThreadDurationCount) limitations.push('Renderer main-thread metadata was not identified; long-task coverage may be incomplete.');
+    if (mainThreadIntervals.length && !mergedIntervals.length) limitations.push('Main-thread intervals were found but could not be merged into busy-time windows.');
+    if (mergedIntervals.length) limitations.push('Main-thread busy time is derived from trace task intervals and is not CPU utilization.');
     if (malformedTimestampCount) limitations.push(`${malformedTimestampCount} event(s) with invalid timestamps were skipped.`);
     if (duplicateEventCount) limitations.push(`${duplicateEventCount} duplicate event(s) were discarded.`);
     if (unmatchedEndCount) limitations.push(`${unmatchedEndCount} unmatched duration end marker(s) were ignored.`);
     if (incompleteBeginCount) limitations.push(`${incompleteBeginCount} duration begin marker(s) had no matching end marker.`);
-    if (!mainThreadDurationCount) limitations.push('Renderer main-thread metadata was not identified; long-task coverage may be incomplete.');
-    const droppedTotal = dropped.frames + dropped.heapSamples + dropped.tasks;
-    if (droppedTotal) limitations.push(`${droppedTotal} measurement(s) exceeded the bounded retention limit and were summarized only by counts: ${dropped.frames} frame event(s), ${dropped.heapSamples} heap sample(s), ${dropped.tasks} task candidate(s).`);
+    const droppedTotal = dropped.frames + dropped.heapSamples + dropped.tasks + dropped.busyIntervals;
+    if (droppedTotal) limitations.push(`${droppedTotal} measurement(s) exceeded the bounded retention limit and were summarized only by counts: ${dropped.frames} frame event(s), ${dropped.heapSamples} heap sample(s), ${dropped.tasks} task candidate(s), ${dropped.busyIntervals} busy interval(s).`);
 
     const run = {
       id: `trace-${Date.now()}`, game: 'Zeus vs Hades',
@@ -221,14 +306,22 @@ export function createTraceNormalizer(fileName = 'trace.json', options = {}) {
         processCount: processIds.size,
         threadInfo: [...threadInfoSet], traceOriginUs: timeOrigin, mainThreadDetected: Boolean(mainThreadKey),
         traceDurationMs: Number.isFinite(maxTs) && Number.isFinite(minTs) ? (maxTs - minTs) / 1000 : undefined,
-        diagnostics: { malformedTimestampCount, duplicateEventCount, unmatchedEndCount, incompleteBeginCount, dropped },
+        mainThreadBusyMs: mergedIntervals.length ? busyTotalMs : undefined,
+        mainThreadBusyWindowCount: busySeries.length,
+        diagnostics: {
+          malformedTimestampCount, duplicateEventCount, unmatchedEndCount, incompleteBeginCount, dropped,
+          categories: [...categories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 30).map(([name, count]) => ({ name, count })),
+          phases: [...phases.entries()].sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })),
+          mainThreadIntervalCount: mainThreadIntervals.length,
+          mergedIntervalCount: mergedIntervals.length
+        },
         limitations
       }
     };
     return validateRun(run);
   }
 
-  return { accept, finish };
+  return { accept, finish, stats: () => ({ eventCount, normalizedEventCount }) };
 }
 
 export function parseChromeTraceText(text, fileName = 'trace.json') {

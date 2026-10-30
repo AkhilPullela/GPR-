@@ -4,8 +4,9 @@ import { parseChromeTraceFile, parseChromeTraceText, parseMarkerText } from '../
 import { summarizeRun, summarizeRounds, generateFindings, compareBaseline, analyzeRun } from '../gpr/analyze.js';
 import { toCsv, reportHtml, reportCsvFiles, createSnapshot } from '../gpr/reports.js';
 import { createDemoRun } from '../gpr/demo.js';
-import { SOURCE } from '../gpr/model.js';
+import { SOURCE, metricAvailability, METRIC_STATUS } from '../gpr/model.js';
 import { parseChromeTraceInWorker } from '../gpr/traceWorkerClient.js';
+import { createImportManager, initialImportState, isBusyStage } from '../gpr/importSession.js';
 
 const syntheticTrace = JSON.stringify({ traceEvents: [
   { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
@@ -409,3 +410,279 @@ test('the HTML report keeps charts, metric definitions, page numbers, and proven
   assert.match(html, /Trace metadata|evidence/i);
 });
 
+
+// --- Metric extraction from realistic Chrome trace shapes -------------------
+
+// Chrome writes heap counters as UpdateCounters with jsHeapSizeUsed inside
+// args.data, and renders main-thread frames as FireAnimationFrame.
+function realisticTrace({ frames = 120, heap = true, mainThread = true } = {}) {
+  const events = [];
+  const t0 = 1000000;
+  if (mainThread) {
+    events.push({ pid: 100, tid: 0, ts: t0, ph: 'M', name: 'process_name', args: { name: 'Renderer' } });
+    events.push({ pid: 100, tid: 259, ts: t0, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } });
+    events.push({ pid: 100, tid: 260, ts: t0, ph: 'M', name: 'thread_name', args: { name: 'Compositor' } });
+  }
+  let ts = t0 + 1000;
+  for (let frame = 0; frame < frames; frame++) {
+    if (mainThread) {
+      events.push({ pid: 100, tid: 259, ts, ph: 'X', name: 'FireAnimationFrame', cat: 'devtools.timeline', dur: 12000 });
+      events.push({ pid: 100, tid: 259, ts: ts + 100, ph: 'B', name: 'RunTask', cat: 'toplevel' });
+      events.push({ pid: 100, tid: 259, ts: ts + 100 + (frame % 30 === 0 ? 90000 : 5000), ph: 'E', name: 'RunTask' });
+      if (heap) events.push({ pid: 100, tid: 259, ts: ts + 5000, ph: 'C', name: 'UpdateCounters', args: { data: { jsHeapSizeUsed: 240000000 + frame * 400000 } } });
+    }
+    events.push({ pid: 100, tid: 260, ts: ts + 8000, ph: 'X', name: 'DrawFrame', cat: 'viz', dur: 3000 });
+    ts += 16667;
+  }
+  return { traceEvents: events, metadata: { buildId: 'real-shape', environment: 'Chrome test' } };
+}
+
+test('extracts heap from UpdateCounters jsHeapSizeUsed instead of reporting it as missing', () => {
+  const run = parseChromeTraceText(JSON.stringify(realisticTrace({ frames: 20 })), 'heap-shape.json');
+  assert.ok(run.samples.some(sample => sample.jsHeapUsedBytes === 240000000));
+  const summary = analyzeRun(run).analysis.summary;
+  assert.equal(summary.heapSampleCount, 20);
+  assert.equal(summary.heapMax, 240000000 + 19 * 400000);
+  assert.equal(summary.availability.memory.status, METRIC_STATUS.CAPTURED);
+});
+
+test('derives main-thread busy time without double-counting nested tasks and keeps it distinct from CPU', () => {
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: [
+    { pid: 1, tid: 2, ts: 1000000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 2, ts: 1000000, ph: 'X', name: 'RunTask', dur: 100000 },
+    { pid: 1, tid: 2, ts: 1020000, ph: 'X', name: 'EvaluateScript', dur: 20000 }
+  ] }), 'busy.json');
+  // The 20 ms event is nested inside the 100 ms event, so busy time is 100 ms.
+  assert.equal(run.metadata.mainThreadBusyMs, 100);
+  assert.equal(run.metadata.diagnostics.mergedIntervalCount, 1);
+  assert.equal(run.metadata.diagnostics.mainThreadIntervalCount, 2);
+  const summary = analyzeRun(run).analysis.summary;
+  assert.equal(summary.busyPeak, 10);
+  assert.equal(summary.cpuAvg, undefined, 'task time must never be reported as CPU utilization');
+  assert.equal(summary.availability.mainThreadBusy.status, METRIC_STATUS.CAPTURED);
+  assert.equal(summary.availability.cpuPercent.status, METRIC_STATUS.UNSUPPORTED);
+});
+
+test('applies the main-thread filter even when thread_name metadata appears after the tasks', () => {
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: [
+    { pid: 1, tid: 2, ts: 1000000, ph: 'X', name: 'RunTask', dur: 60000 },
+    { pid: 1, tid: 9, ts: 1000000, ph: 'X', name: 'RunTask', dur: 90000 },
+    { pid: 1, tid: 2, ts: 1100000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 9, ts: 1100000, ph: 'M', name: 'thread_name', args: { name: 'Compositor' } }
+  ] }), 'late-thread-name.json');
+  assert.equal(run.tasks.length, 1);
+  assert.equal(run.tasks[0].durationMs, 60);
+  assert.equal(run.metadata.mainThreadBusyMs, 60);
+});
+
+test('reports CPU, heap, and React/Redux availability honestly for a trace without those sources', () => {
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: [
+    { pid: 1, tid: 2, ts: 1000, ph: 'M', name: 'thread_name', args: { name: 'CrRendererMain' } },
+    { pid: 1, tid: 2, ts: 2000, ph: 'X', name: 'RunTask', dur: 60000 }
+  ] }), 'sparse.json');
+  const availability = metricAvailability(run);
+  assert.equal(availability.cpuPercent.status, METRIC_STATUS.UNSUPPORTED);
+  assert.equal(availability.memory.status, METRIC_STATUS.NOT_CAPTURED);
+  assert.equal(availability.reactRedux.status, METRIC_STATUS.NOT_CAPTURED);
+  assert.equal(availability.frames.status, METRIC_STATUS.NOT_CAPTURED);
+  assert.equal(availability.cpuPercent.available, false);
+  assert.ok(availability.cpuPercent.reason.length > 10);
+  assert.ok(availability.memory.howToCapture.length > 10);
+  // No finding may present an absent metric as a measured zero.
+  const findings = generateFindings(run);
+  assert.equal(findings.some(f => f.value === 0), false);
+});
+
+test('records bounded event category, phase, and interval diagnostics for the panel', () => {
+  const run = parseChromeTraceText(JSON.stringify(realisticTrace({ frames: 30 })), 'diagnostics.json');
+  const diagnostics = run.metadata.diagnostics;
+  assert.ok(diagnostics.categories.some(category => category.name === 'devtools.timeline'));
+  assert.ok(diagnostics.phases.some(phase => phase.name === 'C'));
+  assert.ok(diagnostics.phases.some(phase => phase.name === 'M'));
+  assert.ok(diagnostics.mergedIntervalCount > 0);
+  assert.equal(run.metadata.mainThreadDetected, true);
+  assert.ok(run.metadata.processCount >= 1);
+});
+
+test('a trace with no main-thread metadata still reports partial availability rather than zero metrics', () => {
+  const run = parseChromeTraceText(JSON.stringify({ traceEvents: [
+    { pid: 5, tid: 7, ts: 1000, ph: 'X', name: 'DrawFrame', dur: 5000 },
+    { pid: 5, tid: 7, ts: 20000, ph: 'X', name: 'DrawFrame', dur: 5000 }
+  ] }), 'no-main-thread.json');
+  assert.equal(run.metadata.mainThreadDetected, false);
+  const availability = metricAvailability(run);
+  assert.equal(availability.tasks.status, METRIC_STATUS.NOT_CAPTURED);
+  assert.equal(availability.frames.status, METRIC_STATUS.CAPTURED);
+  assert.ok(availability.tasks.reason.includes('metadata') || availability.tasks.reason.includes('main-thread'));
+});
+
+// --- Import session: visibility, ordering, cancellation, progress ----------
+
+function fileLike(name, size, type = 'application/json') { return { name, size, type }; }
+
+test('a successful import updates state and delivers the result without a reload', async () => {
+  const states = [];
+  const results = [];
+  const manager = createImportManager({
+    parse: async () => ({ id: 'run-1', metadata: { normalizedEventCount: 42, eventCount: 50 }, tasks: [] }),
+    onState: state => states.push(state),
+    onResult: (run, file) => results.push({ run, file })
+  });
+  await manager.start(fileLike('trace.json', 100));
+  assert.equal(results.length, 1);
+  assert.equal(results[0].run.id, 'run-1');
+  assert.equal(results[0].file.name, 'trace.json');
+  assert.equal(manager.getState().status, 'completed');
+  assert.equal(manager.getState().stage, 'completed');
+  assert.equal(manager.getState().percent, 100);
+  assert.ok(states.some(state => state.stage === 'validating'));
+  assert.ok(states.some(state => state.stage === 'completed'));
+});
+
+test('progress state advances through every processing stage with monotonic percentages', async () => {
+  const stages = [];
+  const manager = createImportManager({
+    throttleMs: 0,
+    parse: async (file, name, onProgress) => {
+      for (const [stage, percent] of [['reading', 10], ['reading', 55], ['parsing', 100], ['normalizing', undefined], ['analyzing', undefined], ['findings', undefined], ['preparing', undefined]]) onProgress({ stage, message: stage, percent });
+      return { id: 'run', metadata: { normalizedEventCount: 1 }, tasks: [] };
+    },
+    onState: state => stages.push(state.stage)
+  });
+  await manager.start(fileLike('trace.json', 10));
+  for (const stage of ['selected', 'validating', 'reading', 'parsing', 'normalizing', 'analyzing', 'findings', 'preparing', 'completed']) {
+    assert.ok(stages.includes(stage), `expected stage ${stage} in ${stages.join(',')}`);
+  }
+});
+
+test('the newest import wins: a slower older import cannot overwrite a newer result', async () => {
+  const results = [];
+  let releaseFirst;
+  const manager = createImportManager({
+    parse: (file) => file.name === 'slow.json'
+      ? new Promise(resolve => { releaseFirst = () => resolve({ id: 'slow', metadata: { normalizedEventCount: 1 }, tasks: [] }); })
+      : Promise.resolve({ id: 'fast', metadata: { normalizedEventCount: 2 }, tasks: [] }),
+    onResult: run => results.push(run.id)
+  });
+  const first = manager.start(fileLike('slow.json', 10));
+  const second = manager.start(fileLike('fast.json', 10));
+  await second;
+  releaseFirst();
+  await first;
+  assert.deepEqual(results, ['fast'], 'the superseded import must not deliver a result');
+});
+
+test('a failed import preserves the previous successful report and offers retry', async () => {
+  const results = [];
+  let fail = false;
+  const manager = createImportManager({
+    parse: async () => { if (fail) throw new Error('Invalid JSON: unexpected end of input.'); return { id: 'good', metadata: { normalizedEventCount: 1 }, tasks: [] }; },
+    onResult: run => results.push(run.id)
+  });
+  await manager.start(fileLike('good.json', 10));
+  fail = true;
+  await manager.start(fileLike('bad.json', 10));
+  assert.deepEqual(results, ['good'], 'the earlier report must survive a failed import');
+  assert.equal(manager.getState().status, 'error');
+  assert.equal(manager.getState().canRetry, true);
+  assert.match(manager.getState().error, /Invalid JSON/);
+});
+
+test('cancelling an in-flight import reports cancellation and delivers no result', async () => {
+  const results = [];
+  let cancelled = false;
+  const manager = createImportManager({
+    parse: (file, name, onProgress, signal) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => { cancelled = true; reject(Object.assign(new Error('aborted'), { name: 'AbortError' })); });
+    }),
+    onResult: run => results.push(run)
+  });
+  const pending = manager.start(fileLike('slow.json', 10));
+  manager.cancel();
+  await pending;
+  assert.equal(cancelled, true);
+  assert.deepEqual(results, []);
+  assert.equal(manager.getState().status, 'cancelled');
+  assert.equal(manager.getState().canCancel, false);
+});
+
+test('unsupported and empty files fail validation before any parsing work', async () => {
+  let parsed = 0;
+  const manager = createImportManager({ parse: async () => { parsed++; return { id: 'x', metadata: {}, tasks: [] }; } });
+  await manager.start(fileLike('notes.txt', 20, 'text/plain'));
+  assert.equal(manager.getState().status, 'error');
+  assert.match(manager.getState().error, /not a JSON file/i);
+  assert.equal(manager.getState().canRetry, false);
+  await manager.start(fileLike('empty.json', 0));
+  assert.match(manager.getState().error, /empty/i);
+  assert.equal(parsed, 0, 'no parsing should run for rejected files');
+});
+
+test('repeated imports of the same file run independently and reset progress each time', async () => {
+  let calls = 0;
+  const results = [];
+  const manager = createImportManager({
+    parse: async () => { calls++; return { id: `run-${calls}`, metadata: { normalizedEventCount: calls }, tasks: [] }; },
+    onResult: run => results.push(run.id)
+  });
+  const file = fileLike('same.json', 10);
+  await manager.start(file);
+  await manager.start(file);
+  assert.equal(calls, 2);
+  assert.deepEqual(results, ['run-1', 'run-2']);
+  assert.equal(manager.getState().status, 'completed');
+});
+
+test('progress notifications are throttled so React never renders once per event', async () => {
+  let stateEmits = 0;
+  let progressCalls = 0;
+  const manager = createImportManager({
+    throttleMs: 50,
+    now: (() => { let t = 0; return () => (t += 5); })(),
+    parse: async (file, name, onProgress) => {
+      for (let i = 0; i < 500; i++) { progressCalls++; onProgress({ stage: 'reading', message: `read ${i}`, percent: i % 100 }); }
+      return { id: 'run', metadata: { normalizedEventCount: 1 }, tasks: [] };
+    },
+    onState: () => { stateEmits++; }
+  });
+  await manager.start(fileLike('big.json', 1000));
+  assert.equal(progressCalls, 500);
+  // The guarantee is that React is not re-rendered once per event: state
+  // updates must stay well below the raw progress volume.
+  assert.ok(stateEmits < progressCalls / 3, `expected throttling, got ${stateEmits} emits for ${progressCalls} progress calls`);
+  assert.ok(stateEmits > 0);
+});
+
+test('busy-stage helper identifies every processing stage and no terminal stage', () => {
+  for (const stage of ['validating', 'reading', 'parsing', 'normalizing', 'analyzing', 'findings', 'preparing']) assert.equal(isBusyStage(stage), true, stage);
+  for (const stage of ['idle', 'selected', 'completed', 'cancelled', 'error']) assert.equal(isBusyStage(stage), false, stage);
+  assert.equal(initialImportState().status, 'idle');
+});
+
+// --- Dashboard update + report consistency for the new metrics --------------
+
+test('analysis is delivered ready for the dashboard with availability and busy chart data', () => {
+  const run = parseChromeTraceText(JSON.stringify(realisticTrace({ frames: 60 })), 'dashboard.json');
+  const analyzed = analyzeRun(run);
+  assert.ok(analyzed.analysis.summary.availability);
+  assert.ok(analyzed.analysis.chartSamples.mainThreadBusyPercent.length > 0);
+  assert.ok(analyzed.analysis.summary.busyAvg > 0);
+  assert.equal(analyzed.analysis.summary.cpuAvg, undefined);
+  const snapshot = createSnapshot(analyzed);
+  assert.ok(snapshot.summary.availability);
+  const html = reportHtml(snapshot);
+  assert.match(html, /Main-thread busy time/);
+  assert.match(html, /Trace diagnostics/);
+  assert.match(html, /Events in file/);
+  assert.doesNotMatch(html, /undefined/);
+  const files = reportCsvFiles(snapshot);
+  assert.match(files.samples, /main_thread_busy_percent/);
+});
+
+test('stage hooks fire during analysis and abort cleanly when cancelled', () => {
+  const stages = [];
+  const run = parseChromeTraceText(JSON.stringify(realisticTrace({ frames: 10 })), 'stages.json');
+  analyzeRun(run, {}, { onStage: (stage, message) => stages.push({ stage, message }) });
+  assert.deepEqual(stages.map(s => s.stage), ['normalizing', 'analyzing', 'findings', 'preparing']);
+  assert.throws(() => analyzeRun(run, {}, { shouldAbort: () => true }), { name: 'AbortError' });
+});

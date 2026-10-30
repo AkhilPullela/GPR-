@@ -24,6 +24,7 @@ function runInWorker(payload, onProgress = () => {}, signal) {
       const message = event.data || {};
       if (message.type === 'progress') { onProgress(message); return; }
       if (message.type === 'result') finish(resolve, message.run);
+      else if (message.cancelled) finish(reject, new DOMException(message.message || 'Trace processing was cancelled.', 'AbortError'));
       else finish(reject, new Error(message.message || 'Trace parsing failed.'));
     };
     worker.onerror = event => finish(reject, new Error(`Trace processing stopped unexpectedly. The browser may have run out of memory; reduce the DevTools recording time range and retry.${event.message ? ` Details: ${event.message}` : ''}`));
@@ -36,7 +37,7 @@ function runInWorker(payload, onProgress = () => {}, signal) {
 export function parseChromeTraceInWorker(file, fileName, onProgress = () => {}, signal) {
   if (signal?.aborted) return Promise.reject(new DOMException('Import cancelled.', 'AbortError'));
   const cached = file && parsedTraceCache.get(file);
-  if (cached) { onProgress({ stage: 'done', message: 'Using cached normalized trace data…' }); return Promise.resolve(cached); }
+  if (cached) { onProgress({ stage: 'completed', message: 'Using cached normalized trace data…' }); return Promise.resolve(cached); }
   return runInWorker({ type: 'parse', file, fileName }, onProgress, signal).then(run => {
     parsedTraceCache.set(file, run);
     return run;

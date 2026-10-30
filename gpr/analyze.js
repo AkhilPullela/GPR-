@@ -1,4 +1,4 @@
-import { THRESHOLDS, SEVERITY_RANK, metricCoverage } from './model.js';
+import { THRESHOLDS, SEVERITY_RANK, metricCoverage, metricAvailability } from './model.js';
 
 export function percentile(values, p) {
   const sorted = values.filter(Number.isFinite).sort((a, b) => a - b);
@@ -61,16 +61,25 @@ export function summarizeRun(run, config = {}) {
   const frames = metricStats(samples, 'frameDurationMs');
   const heap = metricStats(samples, 'jsHeapUsedBytes');
   const react = metricStats(samples, 'reactCommitMs');
+  const busy = metricStats(samples, 'mainThreadBusyPercent');
+  const cpu = metricStats(samples, 'cpuPercent');
   const tasks = run.tasks || [];
   const taskMax = tasks.reduce((value, task) => Number.isFinite(task.durationMs) ? Math.max(value, task.durationMs) : value, -Infinity);
   const longTasks = tasks.filter(t => t.durationMs >= thresholds.longTaskMs);
   const first = samples.length ? samples[0].timestampMs : undefined;
   const last = samples.length ? samples[samples.length - 1].timestampMs : undefined;
+  const availability = run.metadata?.availability || metricAvailability(run);
   return {
     sampleCount: samples.length,
     coverageDurationMs: Number.isFinite(first) && Number.isFinite(last) ? last - first : undefined,
-    cpuAvg: metricStats(samples, 'cpuPercent').mean !== undefined ? round(metricStats(samples, 'cpuPercent').mean) : undefined,
-    cpuPeak: round(metricStats(samples, 'cpuPercent').max),
+    // cpuAvg/cpuPeak stay undefined unless the trace carried explicit
+    // utilization samples. Main-thread busy time is reported separately so the
+    // two are never conflated.
+    cpuAvg: cpu.mean !== undefined ? round(cpu.mean) : undefined,
+    cpuPeak: round(cpu.max),
+    cpuSampleCount: cpu.count,
+    busyAvg: round(busy.mean), busyPeak: round(busy.max), busySampleCount: busy.count,
+    busyTotalMs: round(run.metadata?.mainThreadBusyMs),
     fpsAvg: round(fps.mean), fpsMin: round(fps.min), fpsSampleCount: fps.count,
     frameCount: frames.count, frameP50: round(percentile(samples.map(s => s.frameDurationMs), .5)), frameP95: round(percentile(samples.map(s => s.frameDurationMs), .95)), frameP99: round(percentile(samples.map(s => s.frameDurationMs), .99)),
     slowFrames: samples.filter(s => Number.isFinite(s.frameDurationMs) && s.frameDurationMs > thresholds.frameBudgetMs).length,
@@ -83,7 +92,8 @@ export function summarizeRun(run, config = {}) {
     taskCount: tasks.length,
     reactCommitP95: percentile(samples.map(s => s.reactCommitMs), .95),
     reactSampleCount: react.count,
-    coverage: metricCoverage(run)
+    availability,
+    coverage: metricCoverage({ ...run, metadata: { ...run.metadata, availability } })
   };
 }
 function firstHeap(samples) { for (const s of samples) if (Number.isFinite(s.jsHeapUsedBytes)) return s.jsHeapUsedBytes; return undefined; }
@@ -122,6 +132,7 @@ export function summarizeRounds(run, config = {}) {
     if (!end) return { roundId: start.roundId, startMs: start.timestampMs, incomplete: true, findings: roundFindings.length, findingCount: roundFindings.length, events: eventsByRound.get(start.roundId) || [] };
     const roundSamples = inRange(samples, start.timestampMs, end.timestampMs);
     const cpu = roundSamples.map(s => s.cpuPercent).filter(Number.isFinite), fps = roundSamples.map(s => s.fps).filter(Number.isFinite), frame = roundSamples.map(s => s.frameDurationMs).filter(Number.isFinite);
+    const busy = roundSamples.map(s => s.mainThreadBusyPercent).filter(Number.isFinite);
     const heapBefore = nearestHeapSample(heapSamples, start.timestampMs, true)?.jsHeapUsedBytes;
     const heapAfter = nearestHeapSample(heapSamples, end.timestampMs, false)?.jsHeapUsedBytes;
     const roundTasks = inRange(tasks, start.timestampMs, end.timestampMs);
@@ -129,7 +140,7 @@ export function summarizeRounds(run, config = {}) {
     const events = inRange(matchingEvents, start.timestampMs, end.timestampMs);
     return {
       roundId: start.roundId, startMs: start.timestampMs, endMs: end.timestampMs, durationMs: end.timestampMs - start.timestampMs,
-      cpuAvg: round(mean(cpu)), cpuPeak: round(max(cpu)), fpsAvg: round(mean(fps)), frameCount: frame.length,
+      cpuAvg: round(mean(cpu)), cpuPeak: round(max(cpu)), busyAvg: round(mean(busy)), busyPeak: round(max(busy)), fpsAvg: round(mean(fps)), frameCount: frame.length,
       frameP50: round(percentile(frame, .5)), frameP95: round(percentile(frame, .95)), frameP99: round(percentile(frame, .99)),
       slowFrames: frame.filter(v => v > thresholds.frameBudgetMs).length,
       heapBefore, heapAfter, heapDelta: Number.isFinite(heapBefore) && Number.isFinite(heapAfter) ? heapAfter - heapBefore : undefined,
@@ -189,10 +200,11 @@ export function generateFindings(run, config = {}) {
     });
   }
 
-  const frameSamples = [], cpuSamples = [], reactSamples = [];
+  const frameSamples = [], cpuSamples = [], reactSamples = [], busySamples = [];
   for (const sample of run.samples) {
     if (Number.isFinite(sample.frameDurationMs) && sample.frameDurationMs > thresholds.frameBudgetMs) frameSamples.push(sample);
     if (Number.isFinite(sample.cpuPercent) && sample.cpuPercent >= thresholds.cpuSpikePercent) cpuSamples.push(sample);
+    if (Number.isFinite(sample.mainThreadBusyPercent) && sample.mainThreadBusyPercent >= thresholds.cpuSpikePercent) busySamples.push(sample);
     const reactDuration = sample.reactCommitMs ?? sample.dispatchDurationMs;
     if (Number.isFinite(reactDuration) && reactDuration >= thresholds.reactCommitMs) reactSamples.push({ sample, reactDuration });
   }
@@ -219,6 +231,17 @@ export function generateFindings(run, config = {}) {
     evidenceQuality: 'measured', evidenceNote: 'Frame intervals are derived from recognized frame marker events, not from arbitrary task durations.',
     investigation: ['Open the slowest frame interval and inspect what ran before it.', 'Check whether the slow frames cluster in a bonus or win animation.', 'Compare the frame-time distribution with a stable run.']
   });
+  pushAggregate(busySamples, {
+    category: 'cpu', severity: busySamples.some(s => s.mainThreadBusyPercent >= thresholds.cpuCriticalPercent) ? 'critical' : 'warning',
+    title: 'Sustained main-thread busy time',
+    observed: `Main-thread busy time reached ${Math.max(...busySamples.map(s => s.mainThreadBusyPercent)).toFixed(1)}% in a one-second window.`,
+    interpretation: 'Busy time is the share of a window the main thread spent inside trace tasks. High values leave little room to paint frames or handle input.',
+    impact: 'Frame pacing and input responsiveness degrade while the main thread stays busy.',
+    rule: `mainThreadBusyPercent >= ${thresholds.cpuSpikePercent}`, threshold: thresholds.cpuSpikePercent, unit: '%', pick: s => s.mainThreadBusyPercent,
+    evidenceQuality: 'measured', evidenceNote: 'Derived from overlapping main-thread task intervals, merged so nested work is counted once. This is not CPU utilization.',
+    investigation: ['Open the busy window and inspect the longest task inside it.', 'Check whether busy windows recur in the same part of a round.', 'Compare with a run that does not show the pattern.']
+  });
+
   pushAggregate(cpuSamples, {
     category: 'cpu', severity: cpuSamples.some(s => s.cpuPercent >= thresholds.cpuCriticalPercent) ? 'critical' : 'warning',
     title: 'CPU utilization spike',
@@ -308,11 +331,35 @@ export function rankFindings(findings, thresholds = THRESHOLDS) {
     .sort((a, b) => b.priority - a.priority || SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 }
 
+/** Ordered processing stages reported to the import UI. */
+export const IMPORT_STAGES = Object.freeze([
+  'selected', 'validating', 'reading', 'parsing', 'normalizing', 'analyzing', 'findings', 'preparing', 'completed'
+]);
+
+export function stageIndex(stage) {
+  const index = IMPORT_STAGES.indexOf(stage);
+  return index === -1 ? -1 : index;
+}
+
 /** Runs every analysis step once so the UI never recomputes it during render. */
-export function analyzeRun(run, config = {}) {
-  const findings = generateFindings(run, config);
-  const analyzed = { ...run, findings };
-  const chartMetrics = ['cpuPercent', 'fps', 'jsHeapUsedBytes', 'reactCommitMs'];
+export function analyzeRun(run, config = {}, hooks = {}) {
+  const { onStage = () => {}, shouldAbort = () => false } = hooks;
+  const check = () => { if (shouldAbort()) throw new DOMException('Trace analysis was cancelled.', 'AbortError'); };
+  onStage('normalizing', 'Normalizing trace events…');
+  check();
+  const availability = metricAvailability(run);
+  const withAvailability = { ...run, metadata: { ...run.metadata, availability } };
+  onStage('analyzing', 'Analyzing performance metrics…');
+  check();
+  const summary = summarizeRun(withAvailability, config);
+  const rounds = summarizeRounds(withAvailability, config);
+  onStage('findings', 'Generating findings…');
+  check();
+  const findings = generateFindings(withAvailability, config);
+  const analyzed = { ...withAvailability, findings };
+  onStage('preparing', 'Preparing dashboard data…');
+  check();
+  const chartMetrics = ['mainThreadBusyPercent', 'cpuPercent', 'fps', 'jsHeapUsedBytes', 'reactCommitMs'];
   const chartSamples = {};
   for (const metric of chartMetrics) {
     const values = [];
@@ -322,10 +369,10 @@ export function analyzeRun(run, config = {}) {
   }
   const longTasks = run.tasks.filter(task => task.durationMs >= (config.longTaskMs ?? THRESHOLDS.longTaskMs));
   analyzed.analysis = {
-    summary: summarizeRun(analyzed, config),
+    summary,
     findings,
     rankedFindings: findings.slice(0, 100),
-    rounds: summarizeRounds(analyzed, config),
+    rounds,
     longTasks,
     chartSamples,
     chartTimeRange: run.samples.length ? [run.samples[0].timestampMs, run.samples[run.samples.length - 1].timestampMs] : [0, 0]

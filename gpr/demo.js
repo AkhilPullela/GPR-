@@ -37,6 +37,22 @@ export function createDemoRun() {
   ];
   return {
     id: 'demo-zeus-32-rounds', game: 'Zeus vs Hades', buildId: 'demo-build-2025.04', environment: 'Synthetic desktop / 60 Hz target', startedAt: new Date(started).toISOString(), source: SOURCE.DEMO,
-    samples, events, findings, tasks: [], metadata: { browser: 'Synthetic fixture', roundCount: rounds, limitations: ['All values are synthetic and are not measurements from the game.'] }
+    samples, events, findings, tasks: [], metadata: {
+      browser: 'Synthetic fixture',
+      roundCount: rounds,
+      eventCount: events.length,
+      normalizedEventCount: samples.length,
+      processCount: 1,
+      threadInfo: ['Synthetic fixture · no real process/thread data'],
+      mainThreadDetected: false,
+      traceDurationMs: samples.length ? samples[samples.length - 1].timestampMs - samples[0].timestampMs : undefined,
+      diagnostics: {
+        phases: [{ name: 'Synthetic', count: samples.length }],
+        categories: [{ name: 'fixture', count: samples.length }],
+        mainThreadIntervalCount: 0,
+        mergedIntervalCount: 0
+      },
+      limitations: ['All values are synthetic and are not measurements from the game.']
+    }
   };
 }
